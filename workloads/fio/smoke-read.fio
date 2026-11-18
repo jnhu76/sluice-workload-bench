@@ -1,0 +1,18 @@
+; Smoke read template (fio x Sluice external engine).
+; The smoke driver (adapters/fio/tests/smoke.sh) substitutes:
+;   __ENGINE__  absolute path to the fio-sluice-<profile>.so to exercise
+;   __FILENAME__ absolute path of a scratch regular file under build/scratch
+;   __BACKEND__  threadpool | uring
+;   __IODEPTH__ 1 | 4 | 16
+; The engine must always be addressed as external:<absolute path>.
+[smoke-read]
+ioengine=external:__ENGINE__
+filename=__FILENAME__
+sluice_backend=__BACKEND__
+rw=read
+bs=4k
+size=1M
+iodepth=__IODEPTH__
+direct=1
+thread=1
+group_reporting=1
