@@ -20,7 +20,15 @@
 namespace fio_sluice {
 
 int sluice_commit(struct thread_data* td) {
-    io_u_mark_submit(td, td->io_u_queued);
+    // Mark only what this engine accepted since the last commit, then clear:
+    // the core's td->io_u_queued is unusable here (ghost/double counting;
+    // see state.hpp). A commit with nothing pending is a no-op, like the
+    // sync engine's guard (engines/sync.c:380-381).
+    auto* state = state_of(td);
+    if (state != nullptr && state->pending_submits != 0) {
+        io_u_mark_submit(td, state->pending_submits);
+        state->pending_submits = 0;
+    }
     return 0;
 }
 
@@ -96,6 +104,7 @@ enum fio_q_status sluice_queue(struct thread_data* td, struct io_u* io_u) {
                                           : EngineState::Slot::Kind::write;
             slot.data = ticket.value();
             slot.sync = {};
+            ++state->pending_submits;
             return FIO_Q_QUEUED;
         }
         auto ticket = ddir == DDIR_SYNC ? state->scope->submit_sync_all({file})
@@ -108,6 +117,7 @@ enum fio_q_status sluice_queue(struct thread_data* td, struct io_u* io_u) {
                                       : EngineState::Slot::Kind::sync_data;
         slot.sync = ticket.value();
         slot.data = {};
+        ++state->pending_submits;
         return FIO_Q_QUEUED;
     } catch (const std::exception& error) {
         state->free_slots.push_back(index);

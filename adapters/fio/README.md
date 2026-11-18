@@ -20,7 +20,7 @@
 | `src/errno_map.hpp` `.cpp` | `IoError → errno` 两规则映射（os_errno 透传；invalid_state/backend_error → EIO + 诊断）；无 fio 依赖，可独立单测 | ✔ |
 | `src/engine.cpp` | ops 表（flags=`FIO_NO_OFFLOAD`）、init/cleanup、版本串 log（revision/profile/fio_source） | ✔ |
 | `src/files.cpp` | open/close（转 generic_*，`F_GETFL` 登记 FileAccess）/get_file_size（纯转交） | ✔ |
-| `src/queue.cpp` | queue（DDIR 映射：READ/WRITE/SYNC/DATASYNC 支持，TRIM 等带 EINVAL 拒绝）+ commit（`io_u_mark_submit`） | ✔ |
+| `src/queue.cpp` | queue（DDIR 映射：READ/WRITE/SYNC/DATASYNC 支持，TRIM 等带 EINVAL 拒绝）+ commit（引擎私有 `pending_submits` 计数喂 `io_u_mark_submit`，不用核心共享 `td->io_u_queued`——后者在 `td_io_getevents` 的 min>0 直调路径上会幽灵/双计提交直方图） | ✔ |
 | `src/events.cpp` | getevents 主循环（take 扫描 → poll_progress → wait_one park；零超时轮询不 park）+ event + 健康失败两 tier | ✔ |
 | `tests/smoke.sh` | 契约冒烟（见 §4） | ✔ |
 | `tests/errno_map_test.cpp` | 映射穷举（os_errno 透传、EIO+诊断分支、eof 非错误） | ✔ |

@@ -50,6 +50,16 @@ struct EngineState {
     // fd -> declared access, registered by open_file (LIFE-02: fd stays fio's)
     std::unordered_map<int, sluice::FileAccess> files;
 
+    // io_u count accepted since the last commit(): the submit-latency
+    // histogram must count exactly what this engine handed to Sluice, never
+    // the core's shared td->io_u_queued. td_io_getevents calls ->commit
+    // directly for min > 0 without td_io_commit's io_u_queued guard
+    // (ioengines.c:291-296 vs :498), so the shared counter both ghosts
+    // (io_u_mark_submit(0) still bumps map[0]/total_submit, io_u.c:1122-1126)
+    // and double-marks batches queued before a batch commit. io_uring keeps
+    // the same private-counter discipline (engines/io_uring.c:868-874).
+    unsigned int pending_submits = 0;
+
     bool failed = false;
 
     bool outstanding() const noexcept {
