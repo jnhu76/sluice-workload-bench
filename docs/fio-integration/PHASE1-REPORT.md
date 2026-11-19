@@ -209,7 +209,7 @@ compare_fio.py}`。逐文件职责见 `adapters/fio/README.md` §1。
 ### E.2 xmake 迁移（替代 Makefile；硬约束 6）
 
 - **Makefile 已删除**（本次复验：仓库根无 Makefile），`xmake.lua` 是唯一构建入口。
-  四个契约目标 + 单测目标 + 两个 check 任务（`xmake.lua:253-297`）：
+  四个契约目标 + 两个单测目标 + 两个 check 任务（`xmake.lua:253-297`）：
 
 | target | 产物 | SDK 前缀 |
 | --- | --- | --- |
@@ -218,6 +218,7 @@ compare_fio.py}`。逐文件职责见 `adapters/fio/README.md` §1。
 | `fio-sluice-noring` | `build/linux/x86_64/release/fio-sluice-noring.so` | `build/noring-pic/sdk`（PIC，独立源树+前缀） |
 | `fio-sluice-ring` | `…/fio-sluice-ring.so`（DT_NEEDED 含 liburing.so.2） | `build/ring-pic/sdk` |
 | `fio-sluice-errno-map-test` | 映射单测二进制 | noring SDK |
+| `fio-sluice-lifecycle-test` | 生命周期契约单测二进制（r2 增补：T1/T2） | `build/noring/sdk`（非 PIC） |
 | task `check` / `check-ring` | `tools/check.py` / `--require-uring`（显式触发才跑负载，exit 77 语义保留） | — |
 
 - 落地时发现并解决的构建现实（`adapters/fio/README.md:63-83`）：

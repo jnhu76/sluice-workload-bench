@@ -24,6 +24,7 @@
 | `src/events.cpp` | getevents 主循环（take 扫描 → poll_progress → wait_one park；零超时轮询不 park）+ event + 健康失败两 tier | ✔ |
 | `tests/smoke.sh` | 契约冒烟（见 §4） | ✔ |
 | `tests/errno_map_test.cpp` | 映射穷举（os_errno 透传、EIO+诊断分支、eof 非错误） | ✔ |
+| `tests/lifecycle_test.cpp` | 生命周期契约（T1 close_file 借用不变式 fail-closed；T2 init 分配失败遏制/回滚/再 init），链接真实引擎 TU；`SLUICE_FIO_INIT_SEAM` 仅编译进该测试二进制 | ✔ |
 | `workloads/fio/smoke-read.fio` / `smoke-write.fio` | 占位符模板（`__ENGINE__/__FILENAME__/__BACKEND__/__IODEPTH__`） | ✔ |
 
 ## 2. 硬性不变式的落点（验收线，ARCH §2）
@@ -56,7 +57,8 @@ xmake check / xmake check-ring                # python3 tools/check.py（显式�
 ```
 
 产物：`build/linux/x86_64/release/{sluice-workload-bench[-ring],
-fio-sluice-noring.so, fio-sluice-ring.so, fio-sluice-errno-map-test}`。
+fio-sluice-noring.so, fio-sluice-ring.so, fio-sluice-errno-map-test,
+fio-sluice-lifecycle-test}`。
 引擎编译注入 `-DSLUICE_REVISION/-DSLUICE_BUILD_PROFILE/-DFIO_SOURCE_TAG`，
 init 时打印一行版本串供对账。
 
