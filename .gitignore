@@ -1,3 +1,4 @@
 /build/
 /results/
+.xmake/
 __pycache__/

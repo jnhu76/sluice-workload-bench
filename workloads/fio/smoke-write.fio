@@ -1,0 +1,19 @@
+; Smoke write+verify template (fio x Sluice external engine).
+; Substitution contract and the external:<absolute path> rule: see
+; workloads/fio/smoke-read.fio.
+; verify=crc32 is used because fio 3.40 has no verify method named "crud"
+; (the posval list in options.c offers md5/crc*/sha* only): crc32 is the
+; cheap checksum the smoke contract's data-verification intent maps to.
+[smoke-write]
+ioengine=external:__ENGINE__
+filename=__FILENAME__
+sluice_backend=__BACKEND__
+rw=write
+bs=4k
+size=1M
+iodepth=__IODEPTH__
+verify=crc32
+do_verify=1
+direct=1
+thread=1
+group_reporting=1
