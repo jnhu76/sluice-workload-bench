@@ -6,8 +6,9 @@
 # Checks: plugin load, threadpool read/write, io_uring read/write, invalid
 # sluice_backend rejected, iodepth 1/4/16, crc32 write+verify data checking,
 # clean process exit (threads/fds observed through /proc while running and
-# gone afterwards). All I/O targets are temporary regular files inside the
-# scratch directory.
+# gone afterwards), engine lifecycle unit tests (errno mapping; close_file
+# fd-borrow invariant and init failure containment). All I/O targets are
+# temporary regular files inside the scratch directory.
 #
 # Note on verify: the task contract names verify=crud, but fio 3.40 has no
 # such verify method (options.c posval offers md5/crc*/sha* only), so the
@@ -25,6 +26,7 @@ targetdir="$root/build/linux/x86_64/release"
 noring_engine="$targetdir/fio-sluice-noring.so"
 ring_engine="$targetdir/fio-sluice-ring.so"
 errno_test="$targetdir/fio-sluice-errno-map-test"
+lifecycle_test="$targetdir/fio-sluice-lifecycle-test"
 fio_expected_version="fio-3.40"
 run_timeout_s=90
 
@@ -69,6 +71,13 @@ if [[ -f "$errno_test" ]] || build_target fio-sluice-errno-map-test "$errno_test
         fail "errno_map_test reported failures"
     else
         log "ok: errno map unit test"
+    fi
+fi
+if [[ -f "$lifecycle_test" ]] || build_target fio-sluice-lifecycle-test "$lifecycle_test"; then
+    if ! "$lifecycle_test" "$scratch/lifecycle" >/dev/null; then
+        fail "lifecycle_test reported failures"
+    else
+        log "ok: engine lifecycle unit test"
     fi
 fi
 

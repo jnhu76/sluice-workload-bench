@@ -7,6 +7,10 @@
 --   fio-sluice-noring            fio external engine .so, noring PIC SDK
 --   fio-sluice-ring              fio external engine .so, ring PIC SDK
 --   fio-sluice-errno-map-test    IoError->errno mapping unit test
+--   fio-sluice-lifecycle-test    engine lifecycle contract test (links the
+--                                real engine TUs against stub fio-core
+--                                callbacks; SLUICE_FIO_INIT_SEAM is defined
+--                                for this target only)
 --
 -- SDK readiness reuses tools/build_sdk.sh unchanged for the non-PIC
 -- prefixes (the script honors SLUICE_SOURCE). The PIC prefixes replicate
@@ -263,6 +267,23 @@ target("fio-sluice-errno-map-test")
                  { force = true })
     before_build(function()
         api_ensure_sdk({ io = io, os = os, try = try }, "noring", false)
+    end)
+
+target("fio-sluice-lifecycle-test")
+    set_kind("binary")
+    add_files("adapters/fio/src/engine.cpp", "adapters/fio/src/queue.cpp",
+              "adapters/fio/src/events.cpp", "adapters/fio/src/files.cpp",
+              "adapters/fio/src/errno_map.cpp",
+              "adapters/fio/tests/lifecycle_test.cpp")
+    add_includedirs("adapters/fio/src")
+    add_includedirs(fio_dir)
+    add_defines("SLUICE_FIO_INIT_SEAM")
+    add_cxxflags("-isystem " .. path.join(sdk_prefix("noring", false), "sdk", "include"),
+                 { force = true })
+    link_setup(path.join(sdk_prefix("noring", false), "sdk"), "noring")
+    before_build(function()
+        api_ensure_sdk({ io = io, os = os, try = try }, "noring", false)
+        api_ensure_fio_source({ io = io, os = os, try = try })
     end)
 
 -- check.py runs small functional workloads: only ever invoked explicitly.
