@@ -16,13 +16,21 @@
 - 环境：E5-2666 v3 / 内核 7.3.3-200.fc44 / btrfs(compress=zstd:1) SATA SSD
   热缓存 / taskset 0-9 / randseed=81；内核自 #622（7.2.11）已漂移，全部
   能力本轮重新实测
+- **两个独立会话**：session-001（非 root，PARTIAL_CPU_ACCOUNTING，208
+  run dir / 785 文件哈希），session-002-root（Owner 现场授权的 sudo 会话，
+  **FULL**：kernel PMU + eBPF + tracepoints + callgraph，98 run dir /
+  311 文件哈希）。密码仅经 `sudo -S` stdin，未落盘、未进 git（已核验）
 
 ## 支持与不可用（G1 capability.json，全部实盘回执）
 
 - SUPPORTED：instructions:u、cycles:u、task-clock:u（= 进程树 user+sys）、
   branches/branch-misses/L1/LLC（counted）、perf record :u 平面采样、
   strace 受控计数
-- UNAVAILABLE（非 root，sudo 需密码；不自行改安全配置）：cycles:k、
+- session-002-root（Owner 授权）：以上全部可用，另加 cycles:k/
+  instructions:k、bpftrace（io_uring syscall+submit_req+punt+complete+
+  futex+sched dwell）、perf record --call-graph dwarf/fp、context-switches/
+  cpu-migrations 精确计数
+- 非 root 会话 UNAVAILABLE：cycles:k、
   bpftrace/eBPF、io_uring/sched tracepoints、io-wq CPU、block 事件、
   context-switches/cpu-migrations 的 PMU 计数（paranoid=2 强制
   exclude_kernel → 恒 0，按 INVALID 处理；切换数用 rusage）、
@@ -63,6 +71,11 @@ F3 不进排名；psync 不进异步排名。
 - **窗口**：native A2 vs C2 差 1.01%（启动/收尾 ≤~1% 验证）；sluice
   7.41%（双 rep <0.1% 一致，机制 NOT_IDENTIFIED，按跨模式不确定度处理）。
 
+### H1–H6 r3（root 数据后）
+
+H1 `ATTRIBUTED（限定）`、H2 `NOT_EXPOSED`、H3 `ATTRIBUTED（SAMPLED）`、
+H5 `ATTRIBUTED（D16 限定）`、H4/H6 `INCONCLUSIVE`。详见 COST-LEDGER §8.4。
+
 ## Observer overhead / event loss
 
 - 扰动按 ramp=0 同口径逐引擎入表：uring 臂 −6%…+1%；**TP 对 perf
@@ -81,12 +94,13 @@ F3 不进排名；psync 不进异步排名。
 
 ## 独立 Review
 
-未参与实现的两名独立 agent：Evidence Auditor（`sha256sum -c` 782/782
-通过；独立复算 6 个数字 5 精确一致 + 1 项指出 ramp 分母错配已修正；
-`.text` 同一性复核通过；无秘密；perf.data 3.68MiB 全 git-ignored）；
+未参与实现的两名独立 agent：Evidence Auditor（首轮 `sha256sum -c`
+537/543，发现 manifest 漂移/clean 分母错配/扰动表为空等；修复后复审
+**785/785 PASS**，证据包完整性 PASS；残留文档旧数字已全部清理）；
 Adversarial Reviewer（12 项证伪清单：4 REFUTED / 5 INCONCLUSIVE /
-3 NOT_TESTED；其窗口界、clean rusage、扰动表、H5 非单调、strace <50% 规则、
-H4/H6 检测限意见已全部吸收）。最终判词 **ATTRIBUTION_PARTIAL**。
+3 NOT_TESTED；窗口界、clean rusage、扰动表、H5 非单调、strace <50% 规则、
+H4/H6 检测限意见已全部吸收）。root 会话后 r3 判词：
+**`ATTRIBUTION_VALID`（归因有效；不含任何优化批准）**。
 
 ## 原始证据校验
 

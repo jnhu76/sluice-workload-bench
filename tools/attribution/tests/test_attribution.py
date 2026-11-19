@@ -362,8 +362,33 @@ class TestRootSession(unittest.TestCase):
         self.assertEqual(summary["per_op"]["enters"], 1.0)
         self.assertEqual(summary["per_op"]["punts"], 0.998)
         self.assertEqual(summary["per_op"]["cqe_events"], 1.0)
-        self.assertEqual(summary["worker_dwell_us_per_op"], 3000.0)
+        self.assertEqual(summary["fio_dwell_us_per_op"], 5000.0)
         self.assertEqual(summary["dwell_ms"]["fio"], 5000.0)
+
+    def test_bpftrace_per_cpu_lines_aggregate(self):
+        raw = ("@dwell[fio]: 100\n@dwell[fio]: 250\n"
+               "@enter[fio]: 7\n@enter[fio]: 5\n")
+        maps = parse_bpftrace.parse_maps(raw)
+        self.assertEqual(maps["dwell"][("fio",)], 350)
+        summary = parse_bpftrace.summarize(maps, 10)
+        self.assertEqual(summary["per_op"]["enters"], 1.2)
+
+    def test_req5_bpf_loss_marks_lossy(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = tmp / "session-loss"
+        (session / "runs").mkdir(parents=True)
+        d = make_run(session, "A1__sluice-threadpool__trace-bpf__rep1",
+                     fio_json=fio_doc(4096 * 100))
+        write(d / "bpftrace.stdout.txt", "@enter[fio]: 10\n")
+        write(d / "bpftrace.stderr.txt",
+              "Attached 6 probes\nLost 927693 events\n")
+        analysis = report.analyze_session(session)
+        row = analysis["normalized"]["A1/sluice-threadpool"]["trace-bpf"][0]
+        self.assertEqual(row["label"], "EBPF_LOSSY")
+        self.assertIn("CAPTURE_DROPPED", row["reliability"])
+        self.assertTrue(row["summary"]["dwell_invalid"])
+        self.assertNotIn("fio_dwell_us_per_op", row["summary"])
 
     def test_bpftrace_lost_events(self):
         self.assertEqual(

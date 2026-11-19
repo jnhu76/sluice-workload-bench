@@ -24,10 +24,10 @@ def parse_maps(raw: str) -> dict:
             continue
         name, key, value = m.group(1), m.group(2), int(m.group(3))
         bucket = maps.setdefault(name, {})
-        if key is None:
-            bucket[("",)] = value
-        else:
-            bucket[tuple(p.strip() for p in key.split(","))] = value
+        k = ("",) if key is None else tuple(
+            p.strip() for p in key.split(","))
+        # bpftrace may print one line per CPU for the same key; aggregate.
+        bucket[k] = bucket.get(k, 0) + value
     return maps
 
 
@@ -67,10 +67,15 @@ def summarize(maps: dict, ios: int | None, comm: str = "fio") -> dict:
         "cqe_events": _sum(maps, "cqe"),
         "futex": _sum(maps, "futex", lambda k: k[0] == comm),
         "fio_dwell_ns": _sum(maps, "dwell", lambda k: k[0] == comm),
-        "worker_dwell_ns": _sum(maps, "dwell", worker),
+        # iou-wrk keys are system-wide comm matches (no ring association
+        # without #622-style correlation): counted, never attributed.
+        "iou_wrk_dwell_ns_system_wide": _sum(maps, "dwell", worker),
+        "iou_wrk_cqe_events_system_wide": _sum(maps, "cqe", worker),
     }
     out = {"comm": comm, "ios": ios, "counts": values,
-           "per_op": {}, "dwell_ms": {}}
+           "per_op": {}, "dwell_ms": {},
+           "attribution_note": "iou-wrk keys are system-wide comm "
+                               "matches; not attributed to this run"}
     if ios:
         for name, count in values.items():
             if name.endswith("_ns"):
@@ -78,8 +83,9 @@ def summarize(maps: dict, ios: int | None, comm: str = "fio") -> dict:
             out["per_op"][name] = round(count / ios, 6)
         out["dwell_ms"] = {
             "fio": round(values["fio_dwell_ns"] / 1e6, 1),
-            "iou_wrk": round(values["worker_dwell_ns"] / 1e6, 1),
+            "iou_wrk_system_wide": round(
+                values["iou_wrk_dwell_ns_system_wide"] / 1e6, 1),
         }
-        out["worker_dwell_us_per_op"] = round(
-            values["worker_dwell_ns"] / 1e3 / ios, 3)
+        out["fio_dwell_us_per_op"] = round(
+            values["fio_dwell_ns"] / 1e3 / ios, 3)
     return out

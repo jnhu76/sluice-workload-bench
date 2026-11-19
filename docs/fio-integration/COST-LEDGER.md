@@ -231,3 +231,84 @@ fio_ioring_prep/queued、io_completed…）。TP 对照：mutex/condvar
   保留原始回执（`runs/INVALID-CFG__*`）；修正为 io_size 后按预注册
   clean×3/pmu×2 重测。
 - 会话早期 C2 单点回执保留为 `runs/SUPERSEDED__*`（不计入分析）。
+
+## 8. Root 会话补充（session-002-root，`FULL` CPU accounting）
+
+独立会话（不与 session-001 混合）：E5 同一机器、同一 SLA/负载形状；
+Owner 现场授权 sudo（密码仅经 `sudo -S` stdin，未落盘）。capability.json
+判词 **FULL**：kernel cycles、eBPF、io_uring/sched tracepoints 全部
+SUPPORTED；`--call-graph dwarf/fp` 可用。
+
+### 8.1 每 I/O 用户/内核分域（counted，100% time-running）
+
+| cell | engine | instr:u | instr:k | cyc:u | cyc:k | ctx/op | migr/op |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A1 | io_uring | 2,762 | 2,676 | 1,474 | 4,074 | 0.0002 | 0 |
+| A1 | sluice-uring | 6,434 | 2,681 | 4,285 | 4,447 | 0.0003 | 0 |
+| A1 | sluice-threadpool | 10,222 | 15,006 | 12,145 | 25,440 | 2.004 | 0.00015 |
+| A2 | io_uring | 2,776 | 2,676 | 1,438 | 4,270 | 0.0002 | 0 |
+| A2 | sluice-uring | 7,993 | 2,655 | 4,530 | 4,608 | 0.0003 | 0 |
+| A2 | sluice-threadpool | 7,886 | 9,368 | 9,155 | 16,918 | 0.864 | 0 |
+
+**关键事实**：sluice-uring 与 native 的**内核侧成本几乎相同**（instr:k
+2,655–2,681 vs 2,676；cyc:k +8–9%）——用户态 +3.7k…+5.2k instr/op 的
+全链差距没有伴随内核侧膨胀；差距属于用户态 Sluice/Adapter 路径。
+TP 的内核侧为 9.4k–15k instr、16.9k–25.4k cycles/op（futex 握手在位）。
+
+### 8.2 eBPF 计数（counted，无丢失；`EBPF_COUNTED`）
+
+| cell | engine | enter/op | submit_req/op | punt(io-wq)/op | cqe[fio]/op | futex/op | fio on-CPU dwell |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A1 | io_uring | 1.000 | 1.000 | **0** | 1.000 | 0.000008 | 2.07 µs/op |
+| A1 | sluice-uring | 1.000 | 1.000 | **0** | 1.000 | 0.000010 | 2.89 µs/op |
+| A1 | sluice-threadpool | — | — | **0** | 0 | 3.00 | 28.03 µs/op |
+| A2 | io_uring | 1.000 | 1.000 | **0** | 1.000 | 0.000007 | 2.17 µs/op |
+| A2 | sluice-uring | 1.000 | 1.000 | **0** | 1.000 | 0.000008 | 3.14 µs/op |
+| A2 | sluice-threadpool | — | — | **0** | 0 | 6.15 | 15.41 µs/op |
+
+- `io_uring_enter` 经 `syscalls:sys_enter_io_uring_enter` 计数（内核 7.3.3
+  已无 `io_uring:io_uring_enter` tracepoint）——两臂均 **1.0000 enter/op**
+  且 `submit_req` 1.0000/op：提交形状等价，非本次 strace 扰动下的结论。
+- **punt = 0**：btrfs + NODATACOW 热缓存路径无 io-wq punt（与 #622 的 FS
+  条件性一致）；io-wq worker 的 dwell/cqe key 为系统级 comm 匹配
+  （0–0.1ms），**不归属本 run**（分析中显式标注）。
+- TP 的 futex 为 **3.00/op（D1）、6.15/op（D16）**（非扰动计数，替代此前
+  strace 值）；fio on-CPU dwell 28.0/15.4 µs/op，与 rusage 任务 CPU 同量级。
+- 早期一次 trace-bpf 尝试在 TP 上触发 bpftrace 丢事件（206,430 /
+  1,452,829）——该批回执已被重测取代；分析器现在对任何丢事件 run 输出
+  `EBPF_LOSSY`（CAPTURE_DROPPED，计数只作下界、dwell 无效），并有测试。
+
+### 8.3 调用栈归因（perf record dwarf，A2 sluice-uring，12K samples，0 lost）
+
+平坦份额：mutex lock 15.03% + unlock 13.98%（29.0%）、
+`RequestScope::take` 10.45%、dispatch_one_locked 3.48%、get_io_u 3.54%。
+
+调用树（children 份额）：
+
+- `sluice_getevents` **44.42%**
+  - `harvest` 27.63% → `RequestScope::take` 25.97% → `RequestBridge::consume` **15.52%**
+  - `poll_progress` 16.36% → `poll` 15.48%：`reap_cqes` 8.40% →
+    `handle_one_cqe` 7.59%（→ finalize 4.83%、offer_terminal 1.51%、
+    release_execution 1.39%）；`publish_one` 5.48%；
+    `find_live_router_cookie_` 1.13%
+- `sluice_queue` **24.25%** → `RequestScope::submit_read` 21.81% →
+  `AsyncIoContext::submit_read` 19.93% → `UringAsyncBackend::submit_read`
+  18.02% → `dispatch_after_accept` 9.75%
+
+即：**观察路径（harvest→take→consume）与提交路径（queue→submit→dispatch）
+合计约 69% 的用户态热点**；mutex 的调用者分布在 consume（RequestCore 状态
+机）、CQE 处理与 submit 路径。内核调用栈（`cycles:k` + fp）显示每 I/O
+的 syscall 进出（~10%）、`filemap_get_read_batch`/`filemap_read`（~8%）、
+`fget`/`fput`（~4.7%）、`xas_load` 3.1%、btrfs 读路径 1.85%——两臂共享
+的 io_uring 每请求内核路径。
+
+### 8.4 判定修订（r3）
+
+| ID | r2 判定 | r3 判定 | 依据 |
+| --- | --- | --- | --- |
+| H1 | LIKELY_BUT_UNPROVEN | **ATTRIBUTED（限定）** | eBPF futex 3.0/6.15、PMU ctx 2.0/0.86、fio dwell、内核侧 9.4–15k instr/op；必要/可删除拆分未完成 |
+| H2 | INCONCLUSIVE（结构 LIKELY） | **NOT_EXPOSED** | 非扰动 tracepoint：两臂 1.0000 enter/op + 1.0000 submit_req/op；内核侧成本等价 |
+| H3 | LIKELY_BUT_UNPROVEN | **ATTRIBUTED（SAMPLED）** | take→consume 25.97%/15.52% 调用树 + counted 深度指令差 |
+| H4 | INCONCLUSIVE | INCONCLUSIVE | ProgressSource 自身符号仍低于检测限；eventfd 未单列 |
+| H5 | LIKELY_BUT_UNPROVEN | **ATTRIBUTED（D16 限定）** | D16 take/harvest 调用树 + counted 深度差 + 内核侧等价排除；D4<D1 非单调性未闭合 |
+| H6 | INCONCLUSIVE | INCONCLUSIVE | 调用树无 copy 符号，但检测限不足以证明"无搬运" |

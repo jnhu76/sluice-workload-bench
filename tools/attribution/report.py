@@ -550,9 +550,21 @@ def _bpf_row(run: dict) -> dict:
         summary = parse_bpftrace.summarize(run["bpftrace"]["maps"], ios)
         lost = run["bpftrace"]["lost_events"]
     direction = ((metrics.get("directions") or {}).get("read") or {})
-    return {"run_id": run["run_id"], "label": "EBPF_COUNTED",
+    label = "EBPF_COUNTED"
+    reliability = "counts exact; no lost-event report"
+    if lost:
+        # #623 coverage class CAPTURE_DROPPED: counts become lower bounds,
+        # dwell-derived values are invalid, and no precise claim is allowed.
+        label = "EBPF_LOSSY"
+        reliability = ("CAPTURE_DROPPED: %d events lost; counters are "
+                       "lower bounds, dwell INVALID" % lost)
+        summary = {"per_op_lower_bound": (summary or {}).get("per_op"),
+                   "dwell_invalid": True,
+                   "counts": (summary or {}).get("counts")}
+    return {"run_id": run["run_id"], "label": label,
             "lifecycle_ios": ios, "iops": direction.get("iops"),
             "summary": summary, "lost_events": lost,
+            "reliability": reliability,
             "join": "NOT_ATTEMPTED (aggregate counts only)"}
 
 

@@ -40,7 +40,14 @@ COST-ATTRIBUTION-METHOD.md（14:29 冻结，早于首个测量 run 14:31）；�
 | bpftrace / eBPF / io_uring / sched tracepoints / io-wq 归因 | UNAVAILABLE | 需 root；sudo 需密码，未做权限提升 |
 | strace -c（受控诊断） | SUPPORTED（扰动大） | syscall 计数用；不用于时延 |
 
-判词：`PARTIAL_CPU_ACCOUNTING`。缺失项不以 0 冒充（测试守护）。
+判词（session-001，非 root）：`PARTIAL_CPU_ACCOUNTING`。缺失项不以 0
+冒充（测试守护）。
+
+**session-002-root（Owner 现场授权 sudo，密码仅经 stdin）**：capability
+判词 **`FULL`**——kernel cycles（cycles:k/instructions:k 100% running）、
+bpftrace/eBPF、io_uring/sched tracepoints、`perf record --call-graph
+dwarf|fp` 全部 SUPPORTED；context-switches/cpu-migrations PMU 计数有效
+（root 绕过 exclude_kernel）。两 session 独立归档，不混合。
 
 ## C. Workload Identity & A/A
 
@@ -154,6 +161,36 @@ LIKELY：两臂均 ~1.0 enter/op，均逐 io launch；strace 计数受 <50% 规�
 take 份额随深度单调 2.44→4.17→12.15%，但指令差 D4<D1 非单调）；
 **H6** `INCONCLUSIVE`（4k 与 64k 均无 copy 样本，但采样功效不足）。
 
+## I-R. Root 会话结果（session-002-root，补充而非替换）
+
+数据：`results/attribution/session-002-root/`（98 个 run dir，
+`sha256-manifest.txt` 311 文件全通过；capability=FULL）。
+
+1. **用户/内核分域（counted）**：A2 native 2,776 u + 2,676 k instr/op、
+   1,438 u + 4,270 k cyc/op；sluice-uring 7,993 u + **2,655 k** instr/op、
+   4,530 u + **4,608 k** cyc/op。**内核侧两臂几乎等价（+8–9% cycles），
+   用户态 +5.2k instr/op 的差距没有内核侧膨胀**——层归属因此确定：
+   差距在用户态 Sluice/Adapter。TP：9.4k–15k k-instr、16.9k–25.4k
+   k-cycles/op（futex 握手）。
+2. **eBPF（非扰动计数）**：两 uring 臂 1.0000 enter/op、1.0000
+   submit_req/op、1.0000 cqe/op；**punt=0**（btrfs+NODATACOW 全 inline，
+   验证 #622 的 FS 条件性）；TP futex 3.00/6.15 per op；
+   fio on-CPU dwell 2.1–3.1µs/op（uring）、15.4–28.0µs/op（TP）。
+   io-wq worker key 为系统级 comm 匹配，**不归属本 run**。
+3. **调用栈（A2 sluice，dwarf，12K samples，0 lost）**：
+   `sluice_getevents` 44.42%（harvest→take→consume 27.63/25.97/15.52%；
+   poll→reap→handle_one_cqe 16.36/8.40/7.59%；publish_one 5.48%）、
+   `sluice_queue` 24.25%（submit_read 21.81% → dispatch 9.75%）；平坦
+   mutex 29.0%。内核栈：syscall 进出 ~10%、filemap 读 ~8%、fget/fput
+   ~4.7%、xas_load 3.1%——两臂共享路径。
+4. **判定修订（r3，详见 COST-LEDGER §8.4）**：H1 `ATTRIBUTED（限定）`、
+   H2 `NOT_EXPOSED`、H3 `ATTRIBUTED（SAMPLED）`、H5 `ATTRIBUTED（D16
+   限定）`、H4/H6 保持 `INCONCLUSIVE`。可优化性判断仍被 #595/#604/
+   #579 门禁阻断，本轮不提出任何优化。
+5. **丢失控制**：早期 trace-bpf 尝试在 TP 上触发 bpftrace 丢事件
+   （206,430/1,452,829）并被重测取代；分析器现对丢事件 run 输出
+   `EBPF_LOSSY`（CAPTURE_DROPPED；计数=下界、dwell 无效），有测试。
+
 ## J. Independent Review
 
 两名独立 agent（未参与实现）分别执行了证据审计与对抗复核，全部主要
@@ -177,11 +214,13 @@ take 份额随深度单调 2.44→4.17→12.15%，但指令差 D4<D1 非单调�
 
 ## K. Final Owner Gate
 
-**`ATTRIBUTION_PARTIAL`**——用户态（instructions/cycles/CPU-time/branch/
-cache）的成本事实成立且独立复算通过；内核/io-wq/eBPF 明确 `UNAVAILABLE`
-（`PARTIAL_CPU_ACCOUNTING`）；至少一项热点（H1 ThreadPool 握手；H5 的
-D16 take/harvest 抬升）得到独立归因证据，但按预注册规则与采样功效，
-它们停在 `LIKELY_BUT_UNPROVEN`，不构成产品优化准入。
+**`ATTRIBUTION_VALID`（跨两层会话合并判词）**——session-001（非 root）
+提供用户态完整归因与 `PARTIAL_CPU_ACCOUNTING` 边界；session-002-root 补齐
+**FULL** 口径：kernel/user 分域 counted、非扰动 eBPF 计数（enter/submit/
+punt/cqe/futex）、dwarf 调用栈与内核栈。关键热点获得独立归因（H1 握手、
+H3 观察路径、H5 D16 抬升；H2 形状等价由 counted 证据否定差异），
+数据口径（窗口/分母/丢失）可信。**注意：ATTRIBUTION_VALID 只描述归因
+数据，不等于任何优化被批准；H4/H6 仍 INCONCLUSIVE，可优化性未评估。**
 
 - **工具交付**：`tools/profile_fio_sluice.py` + `tools/attribution/`（probe/
   clean/clean0/pmu/record/trace/crosscheck/analyze，薄编排层）+ 20 项测试

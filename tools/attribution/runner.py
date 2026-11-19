@@ -196,12 +196,16 @@ class Session:
 
     # -- environment gates --------------------------------------------------
 
-    def gate_environment(self, prep_run: bool = False) -> None:
+    def gate_environment(self, prep_run: bool = False,
+                         allow_bpf: bool = False) -> None:
         """Foreign-process gate always; loadavg gate only before measured
         runs (session-001 receipt: our own 1G prep write/warm-read pushes
         1min loadavg to ~1.5 for a minute -- self-induced churn, not drift;
-        refusing on it aborted the chain mid-session)."""
+        refusing on it aborted the chain mid-session). allow_bpf=True for
+        trace-bpf runs: the bpftrace process IS the observer under test."""
         for pat in ("fio", "perf", "strace", "bpftrace"):
+            if pat == "bpftrace" and allow_bpf:
+                continue
             out = subprocess.run(["pgrep", "-x", pat],
                                  capture_output=True, text=True)
             if out.stdout.strip():
@@ -364,7 +368,7 @@ class Session:
     def run_fio(self, run_id: str, job_text: str, expect_backend=None,
                 timeout_s=None, wrap: list | None = None, diag: bool = False,
                 stdout_to_file: str | None = None, extra: dict | None = None,
-                trace_short: bool = False) -> dict:
+                trace_short: bool = False, own_bpf: bool = False) -> dict:
         """One serial measured run. wrap = argv prefix (perf/strace) placed
         between taskset and fio; its own outputs go to the run dir."""
         run_dir = self.runs_dir / run_id
@@ -389,7 +393,8 @@ class Session:
                        for ln in job_text.splitlines()
                        if ln.startswith("filename=")):
             self.guard(target)
-        self.gate_environment(prep_run=run_id.startswith("prep-"))
+        self.gate_environment(prep_run=run_id.startswith("prep-"),
+                              allow_bpf=own_bpf)
         argv: list = []
         if self.cpu_set:
             argv += ["taskset", "-c", self.cpu_set]
@@ -641,7 +646,12 @@ class Session:
             self._sha256_any(data_file) + "\n")
         if self.sudo_pw:
             # evidence must be readable by the (non-root) auditor
-            subprocess.run(self._sudo(["chmod", "644", str(data_file)]),
+            targets = [data_file]
+            old = run_dir / "perf.data.old"
+            if old.exists():
+                targets.append(old)
+            subprocess.run(self._sudo(["chmod", "644"]
+                                      + [str(t) for t in targets]),
                            capture_output=True, text=True,
                            input=self.sudo_pw + "\n")
 
@@ -661,9 +671,16 @@ tracepoint:io_uring:io_uring_submit_req { @submit[comm] = count(); }
 tracepoint:io_uring:io_uring_queue_async_work { @punt[comm] = count(); }
 tracepoint:io_uring:io_uring_complete { @cqe[comm] = count(); }
 tracepoint:syscalls:sys_enter_futex { @futex[comm] = count(); }
+// on-CPU dwell: arm at switch-IN, account at switch-OUT (two probes;
+// a single prev_comm probe would measure wall time between switches)
+// key by pid: sched_switch runs in the outgoing task's context, so the
+// incoming task's identity comes from args->next_pid, not tid
+tracepoint:sched:sched_switch /strcontains(args->next_comm, "fio") || strcontains(args->next_comm, "iou-wrk")/ {
+    @start[args->next_pid] = nsecs;
+}
 tracepoint:sched:sched_switch /strcontains(args->prev_comm, "fio") || strcontains(args->prev_comm, "iou-wrk")/ {
-    if (@last[tid] != 0) { @dwell[args->prev_comm] += nsecs - @last[tid]; }
-    @last[tid] = nsecs;
+    if (@start[args->prev_pid] != 0) { @dwell[args->prev_comm] += nsecs - @start[args->prev_pid]; }
+    delete(@start[args->prev_pid]);
 }
 interval:s:14 { exit(); }
 """
@@ -694,7 +711,7 @@ interval:s:14 { exit(); }
                 proc.stdin.close()
                 time.sleep(1.0)
                 rec = self.run_with_retry(
-                    run_id, job_text=job,
+                    run_id, job_text=job, own_bpf=True,
                     expect_backend=engine_specs()[engine][1] or None,
                     extra={"bpf_script": script.name})
                 try:
@@ -786,9 +803,8 @@ interval:s:14 { exit(); }
         for path in sorted(self.root.rglob("*")):
             if path.is_file() and "sha256-manifest" not in path.name:
                 rel = path.relative_to(self.root)
-                if path.name == "perf.data":  # large: digest only
-                    lines.append("%s  %s" % (sha256_file(path), rel))
-                    continue
-                lines.append("%s  %s" % (sha256_file(path), rel))
+                # root-owned perf artifacts may be 0600: hash via sudo as
+                # needed so the manifest is complete in root sessions
+                lines.append("%s  %s" % (self._sha256_any(path), rel))
         (self.root / "sha256-manifest.txt").write_text("\n".join(lines)
                                                        + "\n")
