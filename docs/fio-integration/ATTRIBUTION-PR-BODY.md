@@ -19,10 +19,15 @@
 
 ## 支持与不可用（G1 capability.json，全部实盘回执）
 
-- SUPPORTED：instructions:u、cycles:u、task-clock:u、context-switches、
-  cpu-migrations、perf record :u 采样（含 dwarf callgraph）、strace 计数
+- SUPPORTED：instructions:u、cycles:u、task-clock:u（= 进程树 user+sys）、
+  branches/branch-misses/L1/LLC（counted）、perf record :u 平面采样、
+  strace 受控计数
 - UNAVAILABLE（非 root，sudo 需密码；不自行改安全配置）：cycles:k、
-  bpftrace/eBPF、io_uring/sched tracepoints、io-wq CPU、block 事件
+  bpftrace/eBPF、io_uring/sched tracepoints、io-wq CPU、block 事件、
+  context-switches/cpu-migrations 的 PMU 计数（paranoid=2 强制
+  exclude_kernel → 恒 0，按 INVALID 处理；切换数用 rusage）、
+  perf --call-graph dwarf/fp（事件打不开；perf 失败仍 exit 0，已按输出
+  文本判定）
 - 判词：`PARTIAL_CPU_ACCOUNTING`——用户态归因完整，内核侧明示不可测，
   缺项不以 0 冒充（12 项自动化测试之一守护该不变量）
 
@@ -30,7 +35,8 @@
 
 A1 randread 4k D1 / A2 randread 4k D16 / A3 seqread 64k D4 / A4 randread
 4k D4 × {io_uring, sluice-uring, sluice-threadpool} + A1 psync D1 参照 +
-C2（A2 形态 number_ios=5M，窗口交叉核验）。F3 不进排名。
+C2（A2 形态，io_size=20G 定长 5.24M ios，窗口交叉核验，clean×3/pmu×2）。
+F3 不进排名；psync 不进异步排名。
 
 ## 关键口径（MEASUREMENT-WINDOW-CONTRACT.md）
 
@@ -40,16 +46,34 @@ C2（A2 形态 number_ios=5M，窗口交叉核验）。F3 不进排名。
 
 ## 结果摘要（数字以 COST-LEDGER.md 为准，全部可溯原始回执）
 
-RESULTS_SUMMARY_PLACEHOLDER
+- **每 I/O 用户态成本（counted，PROCESS_LIFECYCLE 口径）**：native
+  io_uring 2,733–2,779 instr/op / 1,471–1,671 cycles/op；sluice-uring
+  5,991–8,001 instr/op / 3,906–4,582 cycles/op。全链差额 +3,259…+5,226
+  instr/op（+117%…+188%，time_based cells）；C2 定长 cell +5,894（+215%，
+  单模式口径，携带 7.4% 跨模式不确定度）。task total CPU：native
+  1.7µs/op（4k）→ sluice 2.5–2.7µs/op；64k cell 8.2→8.9µs/op。
+- **ThreadPool**：mutex/condvar 40–51%（SAMPLED）、ctx 0.9–2.5/op
+  （rusage）、task CPU 14–37µs/op；A1 吞吐为 native 的 0.06×。
+- **提交形状**：两臂均 ~1.0000 enter/op（shape 精确闭合 65,536/65,536；
+  sluice 另有一次 wait enter）；native 每次 enter 带 GETEVENTS、sluice
+  flags=0 + 用户态 peek — **不存在"sluice 才逐 submit flush"**。
+- **深度信号**：RequestScope::take 采样份额 2.44% (D1) → 4.17% (D4) →
+  12.15% (D16)；但指令差 D4<D1 非单调，H5 判
+  `LIKELY_BUT_UNPROVEN`。
+- **窗口**：native A2 vs C2 差 1.01%（启动/收尾 ≤~1% 验证）；sluice
+  7.41%（双 rep <0.1% 一致，机制 NOT_IDENTIFIED，按跨模式不确定度处理）。
 
 ## Observer overhead / event loss
 
-- perf stat ≈0%（pmu-run IOPS vs clean 同数量级，逐引擎见表）
-- strace -c：IOPS 显著下降（逐引擎实测百分比入表）——计数用于 syscall
-  形态（enter/op、futex/op），不用于时延
-- perf record：SAMPLED 归因（函数占比），与 counted per-op 分表呈现
+- 扰动按 ramp=0 同口径逐引擎入表：uring 臂 −6%…+1%；**TP 对 perf
+  stat/record 高度敏感（−24%…−43%）**；A1 sluice/TP 的 record 运行自身慢
+  18–24%（其采样只作机制定性），A2 record 接近 clean
+- strace -c：IOPS 降至 bare 的 3.8–18.3% → 触发预注册 <50% 规则，
+  enter/futex 计数形态可用，相关 H1/H2 结论降为 INCONCLUSIVE 级
+- perf record：SAMPLED 归因（函数占比），与 counted per-op 分表呈现；
+  `Total Lost Samples: 0`
 - 事件丢失：本环境无 eBPF 流；strace -c 无丢失概念；bpftrace lost-event
-  检测器与 AMBIGUOUS 降级路径已实现并有测试（未见丢失事件可报）
+  检测器与 AMBIGUOUS 降级路径已实现并有测试
 
 ## #639 H1–H6 对照
 
@@ -57,13 +81,21 @@ RESULTS_SUMMARY_PLACEHOLDER
 
 ## 独立 Review
 
-INDEPENDENT_REVIEW_PLACEHOLDER
+未参与实现的两名独立 agent：Evidence Auditor（`sha256sum -c` 782/782
+通过；独立复算 6 个数字 5 精确一致 + 1 项指出 ramp 分母错配已修正；
+`.text` 同一性复核通过；无秘密；perf.data 3.68MiB 全 git-ignored）；
+Adversarial Reviewer（12 项证伪清单：4 REFUTED / 5 INCONCLUSIVE /
+3 NOT_TESTED；其窗口界、clean rusage、扰动表、H5 非单调、strace <50% 规则、
+H4/H6 检测限意见已全部吸收）。最终判词 **ATTRIBUTION_PARTIAL**。
 
 ## 原始证据校验
 
 `results/attribution/session-001/`（git-ignored 工作区证据树）：
 `sha256-manifest.txt` 全树哈希；Evidence Auditor 独立复算记录
-EVIDENCE_AUDIT_PLACEHOLDER
+整树 782 文件 `sha256sum -c` 全通过（会话结束后重生成）；
+`analysis/runs-index.json` 为从 run 目录重建的权威索引（208 个 run dir，
+其中 23 个失败/作废回执保留且排除）。大型 perf.data 仅留本地 +
+`perf.data.sha256` 侧车；无 sudo 口令或秘密。
 
 ## 未覆盖范围与重开条件
 

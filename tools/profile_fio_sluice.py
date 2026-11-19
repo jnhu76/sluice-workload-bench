@@ -43,6 +43,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--repeats", type=int, default=None)
     ap.add_argument("--no-aux", action="store_true",
                     help="pmu: skip aux event groups")
+    ap.add_argument("--clean-ramp", type=int, default=None,
+                    help="clean: force ramp_time (0 -> mode 'clean0', the "
+                         "only window-matched clean grid for rusage/op)")
     ap.add_argument("--runtime", type=int, default=10)
     ap.add_argument("--ramp-time", type=int, default=2)
     ap.add_argument("--file-size", default="1G")
@@ -99,9 +102,14 @@ def main() -> int:
             print("  %-22s %s" % (row, matrix[row]["status"]))
         return 0
 
+    # Exit code reflects THIS invocation only: the manifest is reloaded
+    # across modes, and historical failed receipts (kept on disk) must not
+    # fail a later, successful mode invocation.
+    start = len(session.manifest_runs)
     if args.mode == "clean":
         session.mode_clean(args.cases, args.engines,
-                           repeats=args.repeats or 3)
+                           repeats=args.repeats or 3,
+                           ramp=args.clean_ramp)
     elif args.mode == "pmu":
         session.mode_pmu(args.cases, args.engines,
                          repeats=args.repeats or 2,
@@ -114,13 +122,13 @@ def main() -> int:
         session.mode_crosscheck(args.engines)
 
     session.write_sha_manifest()
-    for entry in session.manifest_runs[-8:]:
+    new_runs = session.manifest_runs[start:]
+    for entry in (new_runs or session.manifest_runs)[-8:]:
         print("%-52s %s" % (entry["run_id"], entry["status"]))
-    blocked = [e for e in session.manifest_runs if e["status"] != "ok"]
-    print("total runs: %d (non-ok: %d)"
-          % (len(session.manifest_runs), len(blocked)))
-    return 1 if any(e["status"] == "fail" for e in session.manifest_runs) \
-        else 0
+    blocked = [e for e in new_runs if e["status"] != "ok"]
+    print("runs this invocation: %d (non-ok: %d); session total: %d"
+          % (len(new_runs), len(blocked), len(session.manifest_runs)))
+    return 1 if any(e["status"] == "fail" for e in new_runs) else 0
 
 
 if __name__ == "__main__":

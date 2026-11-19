@@ -176,21 +176,26 @@ class TestTraceAndJoins(unittest.TestCase):
         self.assertIn("duplicate", verdict["reason"])
 
     def test_strace_summary_parsing(self):
-        raw = (" 0.000012    0.000012    12        11         0 io_uring_enter\n"
-               " 3.100000    0.041000    74000     73000      2 futex\n")
+        raw = ("% time     seconds  usecs/call     calls    errors syscall\n"
+               " 15.62    1.219954          19     61631           io_uring_enter\n"
+               "  2.73    0.213425        4446        48         3 futex\n")
         syscalls = parse_trace.parse_strace_summary(raw)
-        self.assertEqual(syscalls["io_uring_enter"]["calls"], 11)
-        self.assertEqual(syscalls["futex"]["calls"], 73000)
-        self.assertEqual(syscalls["futex"]["errors"], 2)
+        self.assertEqual(syscalls["io_uring_enter"]["calls"], 61631)
+        self.assertEqual(syscalls["io_uring_enter"]["errors"], 0)
+        self.assertEqual(syscalls["futex"]["calls"], 48)
+        self.assertEqual(syscalls["futex"]["errors"], 3)
 
     def test_enter_shape_parsing(self):
-        raw = ("io_uring_enter(6, 1, 0, ...) = 1\n"
-               "io_uring_enter(6, 1, 0, ...) = 1\n"
-               "io_uring_enter(6, 16, 1, ...) = 16\n")
+        raw = ("io_uring_enter(6, 1, 0, 0, NULL, 0) = 1\n"
+               "io_uring_enter(6, 1, 0, 0, NULL, 0) = 1\n"
+               "io_uring_enter(6, 16, 1, IORING_ENTER_GETEVENTS, NULL, 8) = 16\n")
         shape = parse_trace.parse_io_uring_enter_lines(raw)
         self.assertEqual(shape["enters"], 3)
-        self.assertEqual(shape["to_submit_min_complete"][(1, 0)], 2)
-        self.assertEqual(shape["to_submit_min_complete"][(16, 1)], 1)
+        self.assertEqual(shape["to_submit_min_complete_flags"]
+                         ["to_submit=1,min_complete=0,flags=0"], 2)
+        self.assertEqual(shape["to_submit_min_complete_flags"]
+                         ["to_submit=16,min_complete=1,"
+                          "flags=IORING_ENTER_GETEVENTS"], 1)
 
 
 def build_session(tmp: pathlib.Path, variant: str = "ok") -> pathlib.Path:
@@ -276,8 +281,9 @@ class TestAnalyze(unittest.TestCase):
                          1881.0)
         window = json.loads((session / "analysis" / "window-contract.json")
                             .read_text())
-        # A2 io_uring absent here -> no delta; verdict stays lifecycle
-        self.assertEqual(window["verdict"], "PROCESS_LIFECYCLE_PRIMARY")
+        # this fixture has no A2/C2 pair, so no per-engine delta is due
+        self.assertIn("verdict", window)
+        self.assertEqual(window.get("per_engine"), {})
 
     def test_req8_f3_not_ranked(self):
         session = build_session(self.tmp)
@@ -292,9 +298,12 @@ class TestAnalyze(unittest.TestCase):
         norm = analysis["normalized"]["A1/sluice-uring"]
         self.assertIn("clean", norm)
         self.assertIn("pmu", norm)
-        # clean IOPS comes ONLY from clean runs; pmu rows carry no iops
-        self.assertNotIn("iops", norm["pmu"][0])
+        # each row keeps its own provenance: pmu rows come from pmu runs,
+        # clean rows from clean runs; nothing is merged across modes
+        self.assertIn("pmu", norm["pmu"][0]["run_id"])
         self.assertEqual(len(norm["clean"]["runs"]), 2)
+        for run in norm["clean"]["runs"]:
+            self.assertIn("__clean__", run["run_id"])
 
     def test_req12_sampled_never_exact(self):
         session = build_session(self.tmp)
@@ -363,9 +372,11 @@ class TestWindowContract(unittest.TestCase):
                              {}).setdefault(
                 "modes", {}).setdefault(parts["mode"], []).append(run)
         window = report._window_contract(cells)
-        self.assertAlmostEqual(window["A2_vs_C2_instructions_delta_pct"],
-                               1.0, places=1)
+        native = window["per_engine"]["io_uring"]
+        self.assertAlmostEqual(native["delta_pct_of_C"], 1.0, places=1)
         self.assertTrue(window["startup_share_bound_ok"])
+        self.assertEqual(window["startup_share_bound_pct"],
+                         native["delta_pct_of_C"])
 
 
 if __name__ == "__main__":

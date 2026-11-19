@@ -17,8 +17,10 @@ import subprocess
 # Event groups actually used by the runner. Probed verbatim so the capability
 # matrix describes the measurement, not a generic wish list.
 MAIN_EVENTS = ("instructions:u", "cycles:u", "task-clock:u")
-AUX1_EVENTS = ("branches:u", "branch-misses:u",
-               "context-switches", "cpu-migrations")
+# Scheduling counters are NOT measured via PMU here: at paranoid=2 perf
+# applies exclude_kernel, zeroing context-switches/cpu-migrations. They
+# come from process rusage instead (exact, scope = fio process tree).
+AUX1_EVENTS = ("branches:u", "branch-misses:u")
 AUX2_EVENTS = ("L1-dcache-loads:u", "LLC-loads:u")
 KERNEL_EVENT = "cycles:k"
 
@@ -59,6 +61,43 @@ def probe_perf_event(event: str, env=None) -> dict:
                 "evidence": receipt}
     # A scaled (multiplexed) single-event probe cannot happen (one event,
     # one counter), so 100% running is expected; anything else is PARTIAL.
+    return {"status": "SUPPORTED", "reason": "", "evidence": receipt}
+
+
+def probe_sw_event_effective(event: str, env=None) -> dict:
+    """Software events under paranoid=2: perf silently sets exclude_kernel,
+    so kernel-occurring SW events (context switches, migrations) count as
+    ZERO even under heavy scheduling. A zero on a switching workload means
+    UNAVAILABLE, never 'no switches happened' (session-001 receipt: every
+    aux run reported 0 ctx/migrations while process rusage showed 1k-1M).
+    """
+    perf = _which("perf", env)
+    if perf is None:
+        return {"status": "UNAVAILABLE", "reason": "perf not found",
+                "evidence": "which perf -> not found"}
+    # nanosleep entry/exit guarantees voluntary context switches.
+    receipt = _run([perf, "stat", "-x,", "-e", event, "--",
+                    "/bin/sh", "-c", "sleep 0.05"], env=env)
+    out = receipt["stdout"] + receipt["stderr"]
+    row = None
+    for line in out.splitlines():
+        if event in line and "," in line:
+            row = line
+            break
+    if row is None:
+        return {"status": "UNAVAILABLE", "reason": "event row absent",
+                "evidence": receipt}
+    try:
+        value = row.split(",", 1)[0]
+        zero = value.startswith("<") or int(value) == 0
+    except ValueError:
+        zero = True
+    if zero:
+        return {"status": "UNAVAILABLE",
+                "reason": "perf enforces exclude_kernel at "
+                          "perf_event_paranoid=2; kernel-occurring software "
+                          "event reads 0 and is not usable as a count",
+                "evidence": receipt}
     return {"status": "SUPPORTED", "reason": "", "evidence": receipt}
 
 
@@ -245,8 +284,9 @@ def probe_all(env=None) -> dict:
         "user_cycles": probe_perf_event("cycles:u", env),
         "kernel_cycles": probe_perf_event(KERNEL_EVENT, env),
         "task_clock": probe_perf_event("task-clock:u", env),
-        "context_switches": probe_perf_event("context-switches", env),
-        "cpu_migrations": probe_perf_event("cpu-migrations", env),
+        "context_switches": probe_sw_event_effective("context-switches",
+                                                     env),
+        "cpu_migrations": probe_sw_event_effective("cpu-migrations", env),
         "cache_llc_events": group(AUX2_EVENTS),
         "branch_events": group(AUX1_EVENTS[:2]),
         "perf_callgraph_user": probe_perf_record(env),

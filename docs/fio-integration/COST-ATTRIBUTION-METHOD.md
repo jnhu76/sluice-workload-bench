@@ -60,7 +60,12 @@ repeat、起止时间、引擎 load 行、exit code、rusage、fio JSON 原件�
 ## 5. 预注册验收与停止规则
 
 1. **重复数**：clean ×3 repeats/cell/engine；pmu ×2；record ×1；trace ×1
-   （短窗 3s/256M 专用文件，仅为 syscall 形态计数）。
+   （短窗 3s/256M 专用文件，仅为 syscall 形态计数）。C2 交叉核验：
+   clean ×3 / pmu ×2。**执行偏差（如实记录）**：主链 record 首轮因
+   `--call-graph` 在 paranoid=2 下无法打开事件而失败，改为 flat 采样后
+   重跑；trace 只覆盖 A1/A2（3s 短窗，strace 扰动 3.8–18.3% IOPS，
+   预注册 <50% 规则使其结论降为 INCONCLUSIVE 级，仅计数形态可用）；
+   record 在 r2 补测 A3/A4 后覆盖 A1–A4。
 2. **A/A 验收**：沿用 PERF-BASELINE §2 的 OBSERVED_TWO_REPEAT_SPREAD 语义
    （非噪声底）；本轮 clean 3 repeats 的极差若 >15%（IOPS）标记该 cell
    `HIGH_SPREAD`，只作定性解读。

@@ -193,9 +193,15 @@ def per_op_row(run: dict, window: str) -> dict:
         have_exact = True
         per_op = value / ios
         if "CPU_TIME" in label:
-            row["values"][label] = {"value": round(per_op * 1000.0, 3),
-                                    "class": "counted",
-                                    "scope": "user", "unit": "us"}
+            # task-clock is NOT user-only: on this stack it equals rusage
+            # user+sys per op exactly (measured cross-check), i.e. process
+            # tree CPU time; it still excludes io-wq/kworker threads.
+            row["values"][label] = {
+                "value": round(per_op * 1000.0, 3),
+                "class": "counted", "scope": "task_total",
+                "unit": "us",
+                "scope_note": "user+sys of the fio process tree; excludes "
+                              "io-wq/kworkers (PARTIAL_CPU_ACCOUNTING)"}
         else:
             row["values"][label] = {"value": round(per_op, 3),
                                     "class": "counted", "scope": "user"}
@@ -222,12 +228,15 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
     binrev_path = session_dir / "binary-manifest.json"
     if binrev_path.exists():
         revision = json.loads(binrev_path.read_text()).get("sluice_revision")
-    for run_dir in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
+    for run_dir in sorted(p for p in runs_dir.iterdir()
+                          if p.is_dir() and not p.name.startswith(".")):
         run = load_run(run_dir)
         if run is None:
             continue
         meta = run["meta"]
-        if meta.get("discarded"):
+        if meta.get("discarded") or meta.get("status") != "ok":
+            # Failed receipts stay on disk (evidence discipline) but never
+            # enter the recomputation.
             run["discarded"] = True
         load_line = meta.get("engine_load")
         if load_line:
@@ -250,8 +259,15 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
     normalized = {}
     for (cell, engine), group in sorted(cells.items()):
         entry = {"cell": cell, "engine": engine}
+        # clean  = Phase-1-identical baseline (ramp=2; IOPS/latency stats)
+        # clean0 = ramp=0 un-instrumented runs; the ONLY clean window that
+        #          matches the rusage/lifecycle denominator (per-op rule).
         if "clean" in group["modes"]:
-            entry["clean"] = _aggregate_clean(group["modes"]["clean"])
+            entry["clean"] = _aggregate_clean(group["modes"]["clean"],
+                                              window_matched=False)
+        if "clean0" in group["modes"]:
+            entry["clean0"] = _aggregate_clean(group["modes"]["clean0"],
+                                               window_matched=True)
         for mode in ("pmu", "pmu-aux1", "pmu-aux2"):
             if mode in group["modes"]:
                 rows = []
@@ -259,14 +275,22 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
                     row = per_op_row(run, "process_lifecycle"
                                      if mode == "pmu" else "aux")
                     row["run_id"] = run["run_id"]
+                    direction = (((run["metrics"] or {}).get("directions")
+                                  or {}).get("read") or {})
+                    row["iops"] = direction.get("iops")
+                    row["clat_p99_us"] = direction.get("clat_p99_us")
                     _attach_aux(row, run, mode)
                     rows.append(row)
                 entry[mode] = rows
         if "record" in group["modes"]:
-            entry["record"] = [
-                {"run_id": r["run_id"], "class": "SAMPLED",
-                 "perf_report": r.get("perf_report")}
-                for r in group["modes"]["record"]]
+            entry["record"] = []
+            for r in group["modes"]["record"]:
+                direction = (((r["metrics"] or {}).get("directions")
+                              or {}).get("read") or {})
+                entry["record"].append(
+                    {"run_id": r["run_id"], "class": "SAMPLED",
+                     "iops": direction.get("iops"),
+                     "perf_report": r.get("perf_report")})
         for tmode in ("trace-bare", "trace-straced", "trace-shape"):
             if tmode in group["modes"]:
                 entry[tmode] = [
@@ -280,6 +304,41 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
         json.dumps(normalized, indent=2, sort_keys=True) + "\n")
 
     ranking = _ranking(normalized)
+    comparisons = _comparisons(ranking)
+    # Authoritative per-run index rebuilt from run dirs (the append-only
+    # runs-manifest.json accumulated duplicates across repair invocations).
+    index = []
+    for run in runs:
+        parts = split_run_id(run["run_id"])
+        index.append({
+            "run_id": run["run_id"],
+            "cell": parts.get("cell"), "engine": parts.get("engine"),
+            "mode": parts.get("mode"), "repeat": parts.get("repeat"),
+            "retry": parts.get("retry"),
+            "status": (run["meta"].get("status")),
+            "discarded": bool(run.get("discarded")),
+            "dir": str(pathlib.Path(run["dir"]).name),
+        })
+    (analysis_dir / "runs-index.json").write_text(
+        json.dumps(index, indent=2, sort_keys=True) + "\n")
+
+    # Computed invariants (audit finding: these were hardcoded before).
+    mode_by_run: dict = {}
+    merged = False
+    for entry in normalized.values():
+        for mode in MODES:
+            for row in (entry.get(mode) or []):
+                rid = row.get("run_id") if isinstance(row, dict) else None
+                if not rid:
+                    continue
+                if rid in mode_by_run and mode_by_run[rid] != mode:
+                    merged = True
+                mode_by_run[rid] = mode
+    sampled_isolated = all(
+        row.get("class") == "SAMPLED"
+        and "values" not in row and "per_op" not in row
+        for entry in normalized.values()
+        for row in (entry.get("record") or []))
     analysis = {
         "schema": 1,
         "session": str(session_dir.name),
@@ -293,12 +352,15 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
         "window_contract": window["verdict"],
         "normalized": normalized,
         "ranking": ranking,
+        "comparisons": comparisons,
         "invariants": {
             "f3_excluded_from_ranking": all(
                 not e["cell"].startswith(RANKED_EXCLUDED_PREFIXES)
                 for e in ranking),
-            "modes_never_merged": True,
-            "sampled_isolated": True,
+            "psync_excluded_from_ranking": all(
+                e["engine"] != "psync" for e in ranking),
+            "modes_never_merged": not merged,
+            "sampled_isolated": sampled_isolated,
         },
     }
     (analysis_dir / "analysis.json").write_text(
@@ -306,8 +368,18 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
     return analysis
 
 
-def _aggregate_clean(clean_runs: list) -> dict:
-    out = {"runs": [], "iops_values": []}
+def _aggregate_clean(clean_runs: list, window_matched: bool) -> dict:
+    """window_matched=True is only valid for ramp=0 runs: rusage covers the
+    whole process while fio's io_bytes covers the post-ramp window, so for
+    ramp=2 clean runs a per-op rusage division would be inflated by the
+    ramp fraction (~20% here). Those rows stay raw values, no per-op."""
+    out = {"runs": [], "iops_values": [],
+           "window_matched": window_matched}
+    if not window_matched:
+        out["per_op_note"] = (
+            "CLEAN_RAMP2_LIFECYCLE_MISMATCH: rusage window includes ramp; "
+            "io_bytes excludes it -- no rusage per-op computed here, use "
+            "clean0/pmu rows")
     for run in clean_runs:
         m = run["metrics"] or {}
         direction = (m.get("directions") or {}).get("read") or {}
@@ -328,7 +400,35 @@ def _aggregate_clean(clean_runs: list) -> dict:
         spread = (max(vals) - min(vals)) / (sum(vals) / len(vals)) * 100
         out["observed_spread_pct"] = round(spread, 3)
         out["spread_class"] = "HIGH_SPREAD" if spread > 15 else "ok"
+    if not window_matched:
+        return out
+    # Scheduling counters: rusage is exact and unaffected by the perf
+    # exclude_kernel restriction (scope = fio process tree incl. workers).
+    per_op = []
+    for run in clean_runs:
+        m = run["metrics"] or {}
+        ios = m.get("lifecycle_ios")
+        ru = run["meta"].get("rusage") or {}
+        if ios and ru:
+            per_op.append({
+                "run_id": run["run_id"],
+                "ctx_switches_per_op":
+                    round((ru["ctx_voluntary"] + ru["ctx_involuntary"])
+                          / ios, 6),
+                "cpu_user_us_per_op": round(
+                    ru["cpu_user_s"] * 1e6 / ios, 4),
+                "cpu_sys_us_per_op": round(
+                    ru["cpu_sys_s"] * 1e6 / ios, 4),
+                "cpu_total_us_per_op": round(
+                    (ru["cpu_user_s"] + ru["cpu_sys_s"]) * 1e6 / ios, 4),
+            })
+    if per_op:
+        out["rusage_per_op"] = per_op
     return out
+
+
+SCHED_SW_EVENTS = ("context-switches", "context-switches:u",
+                   "cpu-migrations", "cpu-migrations:u")
 
 
 def _attach_aux(row: dict, run: dict, mode: str) -> None:
@@ -340,6 +440,16 @@ def _attach_aux(row: dict, run: dict, mode: str) -> None:
     aux = {}
     for event, entry in perf.items():
         if entry["kind"] == "counted":
+            # paranoid=2 applies exclude_kernel, so kernel-occurring SW
+            # events read 0 regardless of real activity. A zero there is
+            # INVALID as a count, never "no switches happened" (rusage is
+            # the authoritative scheduling counter).
+            if event in SCHED_SW_EVENTS and not entry["value"]:
+                aux[event] = {
+                    "per_op": None, "class": "INVALID_ZERO_UNDER_"
+                    "EXCLUDE_KERNEL",
+                    "note": "use rusage ctx counters instead"}
+                continue
             aux[event] = {"per_op": round(entry["value"] / ios, 6)
                           if ios else None,
                           "class": "counted"}
@@ -371,50 +481,83 @@ def _trace_row(run: dict) -> dict:
 
 
 def _window_contract(cells: dict) -> dict:
-    """Option B vs Option C: lifecycle per-op vs fixed-count per-op."""
+    """Option B vs Option C, computed PER ENGINE (an audit finding: the
+    original version only checked io_uring). The delta is |B-C|/C using
+    the mean of all valid reps; n(C) is reported because C2 is a single
+    run per engine in this session."""
     verdict = {"option_B": "present" if any(
         "pmu" in group["modes"] for group in cells.values()) else "absent"}
-    comparisons = []
     for (cell, engine), group in cells.items():
         if cell != "C2":
             continue
         for mode in ("clean", "pmu"):
             if mode in group["modes"]:
                 verdict["option_C_%s" % mode] = "present"
-    # Numeric comparison happens in the COST-LEDGER step using this data.
-    verdict["verdict"] = "PROCESS_LIFECYCLE_PRIMARY"
-    b_instr = _pick_per_op(cells, "A2", "pmu", 
-                           "PROCESS_LIFECYCLE_INSTRUCTIONS_per_op")
-    c_instr = _pick_per_op(cells, "C2", "pmu",
-                           "PROCESS_LIFECYCLE_INSTRUCTIONS_per_op")
-    if b_instr is not None and c_instr is not None and c_instr:
-        delta_pct = abs(b_instr - c_instr) / c_instr * 100
-        verdict["A2_vs_C2_instructions_delta_pct"] = round(delta_pct, 3)
-        verdict["startup_share_bound_ok"] = delta_pct <= 10.0
-        if delta_pct > 10.0:
-            verdict["verdict"] = "LIFECYCLE_ONLY_NO_STEADY_STATE_EXTRAPOLATION"
+    per_engine = {}
+    for engine in ("io_uring", "sluice-uring", "sluice-threadpool"):
+        b = _mean_per_op(cells, "A2", engine, "pmu")
+        c = _mean_per_op(cells, "C2", engine, "pmu")
+        if b is None or c is None or not c:
+            continue
+        per_engine[engine] = {
+            "A2_instr_per_op": round(b, 3),
+            "C2_instr_per_op": round(c, 3),
+            "delta_pct_of_C": round(abs(b - c) / c * 100, 3),
+            "C2_reps": _count_ok(cells, "C2", engine, "pmu"),
+            "A2_reps": _count_ok(cells, "A2", engine, "pmu"),
+        }
+    verdict["per_engine"] = per_engine
+    native = per_engine.get("io_uring", {})
+    native_delta = native.get("delta_pct_of_C")
+    if native_delta is not None:
+        verdict["startup_share_bound_pct"] = native_delta
+        verdict["startup_share_bound_ok"] = native_delta <= 10.0
+    if native_delta is not None and native_delta <= 10.0:
+        verdict["verdict"] = "PROCESS_LIFECYCLE_PRIMARY_NATIVE_VERIFIED"
+        verdict["sluice_cross_mode_pct"] = per_engine.get(
+            "sluice-uring", {}).get("delta_pct_of_C")
+        verdict["note"] = (
+            "native 的 B/C 差（启动+模式）<=10%；sluice-uring 的跨模式差"
+            "更大且方向与启动摊销相反（C2 更长却更高），必须按"
+            "MODE_EFFECT 解释，sluice 的 per-op 值携带该量级的跨模式"
+            "不确定度（非启动污染）")
+    else:
+        verdict["verdict"] = "LIFECYCLE_ONLY_NO_STEADY_STATE_EXTRAPOLATION"
     return verdict
 
 
-def _pick_per_op(cells: dict, cell: str, mode: str, label: str):
-    group = cells.get((cell, "io_uring"))
+def _mean_per_op(cells: dict, cell: str, engine: str, mode: str):
+    group = cells.get((cell, engine))
     if not group or mode not in group.get("modes", {}):
         return None
+    values = []
     for run in group["modes"][mode]:
         row = per_op_row(run, "process_lifecycle")
-        if row["status"] == "ok":
-            v = row["values"].get(label, {})
-            if v.get("class") == "counted":
-                return v.get("value")
-    return None
+        if row["status"] != "ok":
+            continue
+        v = row["values"].get("PROCESS_LIFECYCLE_INSTRUCTIONS_per_op", {})
+        if v.get("class") == "counted":
+            values.append(v["value"])
+    return sum(values) / len(values) if values else None
+
+
+def _count_ok(cells: dict, cell: str, engine: str, mode: str) -> int:
+    group = cells.get((cell, engine))
+    if not group or mode not in group.get("modes", {}):
+        return 0
+    return sum(1 for run in group["modes"][mode]
+               if per_op_row(run, "process_lifecycle")["status"] == "ok")
 
 
 def _ranking(normalized: dict) -> list:
-    """Ranking across engines per cell, clean-mode IOPS only. F3-class and
-    non-clean modes never enter."""
+    """Ranking across ASYNC engines per cell, clean-mode IOPS only.
+    F3-class cells and non-clean modes never enter; psync is a synchronous
+    reference (D1-capped), never ranked (COST-ATTRIBUTION-METHOD §2)."""
     table = []
     for key, entry in normalized.items():
         if entry["cell"].startswith(RANKED_EXCLUDED_PREFIXES):
+            continue
+        if entry["engine"] == "psync":
             continue
         clean = entry.get("clean") or {}
         vals = clean.get("iops_values") or []
@@ -423,5 +566,40 @@ def _ranking(normalized: dict) -> list:
         table.append({"cell": entry["cell"], "engine": entry["engine"],
                       "mean_iops": round(sum(vals) / len(vals), 1),
                       "observed_spread_pct": clean.get(
-                          "observed_spread_pct")})
+                          "observed_spread_pct"),
+                      "spread_class": clean.get("spread_class")})
     return table
+
+
+def _comparisons(ranking: list) -> dict:
+    """Pre-registered A/A rule: if a cell's observed spread exceeds 1/3 of
+    the engine-to-native IOPS gap, that cell's clean-IOPS ranking is
+    INCONCLUSIVE (threshold frozen before measurement; not adjustable)."""
+    by_cell: dict = {}
+    for row in ranking:
+        by_cell.setdefault(row["cell"], []).append(row)
+    out = {}
+    for cell, rows in sorted(by_cell.items()):
+        native = next((r for r in rows if r["engine"] == "io_uring"), None)
+        if native is None or not native["mean_iops"]:
+            continue
+        for row in rows:
+            if row["engine"] == "io_uring":
+                continue
+            gap_pct = abs(row["mean_iops"] - native["mean_iops"]) \
+                / native["mean_iops"] * 100
+            spread = row.get("observed_spread_pct")
+            third = gap_pct / 3.0
+            if spread is None:
+                cls = "INCONCLUSIVE_NO_SPREAD"
+            elif spread > third:
+                cls = "INCONCLUSIVE_AA_SPREAD_RULE"
+            else:
+                cls = "OK"
+            out["%s/%s" % (cell, row["engine"])] = {
+                "gap_vs_native_pct": round(gap_pct, 3),
+                "spread_pct": spread,
+                "spread_rule_threshold_pct": round(third, 3),
+                "class": cls,
+            }
+    return out

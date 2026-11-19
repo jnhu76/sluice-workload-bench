@@ -29,57 +29,52 @@ def fmt(v, nd=0):
 def render_main(norm: dict) -> str:
     rows = []
     for key, entry in sorted(norm.items()):
-        pmu = entry.get("pmu") or []
+        pmu = [r for r in (entry.get("pmu") or [])
+               if r.get("status") == "ok"]
         if not pmu:
             continue
-        # mean across reps of counted values
         agg = {}
         for row in pmu:
-            if row.get("status") != "ok":
-                continue
             for label, cell in row["values"].items():
                 if cell.get("class") == "counted":
                     agg.setdefault(label, []).append(cell["value"])
         vals = {label: (sum(v) / len(v) if v else None)
                 for label, v in agg.items()}
         ios = pmu[0].get("denominator")
-        line = "| %s | %s | %s |" % (
-            entry["cell"], entry["engine"],
-            " × ".join("%s" % len(v) for v in agg.values()) or "-")
-        for label in LABELS:
-            line += " %s |" % (fmt(vals.get(label), 1)
-                               if vals.get(label) is not None else "-")
-        rows.append((entry["cell"], entry["engine"], line, ios))
+        rows.append({"cell": entry["cell"], "engine": entry["engine"],
+                     "reps": len(pmu), "ios": ios, "vals": vals})
     if not rows:
         return "(no pmu rows)\n"
     out = ["| cell | engine | reps | instr/op (u) | cycles/op (u) | "
-           "cpu-us/op (u) | denominator |\n", "|---|---|---|---:|---:|---:|---:|\n"]
-    for _c, _e, line, ios in rows:
-        out.append(line + " %s |\n" % ios)
-    # differential rows
-    out.append("\nΔ（sluice-uring − io_uring，同 cell）：\n\n")
-    out.append("| cell | Δinstr/op | Δcycles/op | Δcpu-us/op | Δ/psync参照 |\n|---|---:|---:|---:|---|\n")
-    for cell in sorted({r[0] for r in rows}):
-        def get(engine):
-            for c, e, line, ios in rows:
-                if c == cell and e == engine:
-                    return line
-            return None
-        a, b = get("io_uring"), get("sluice-uring")
+           "cpu-us/op (u) | denominator |\n",
+           "|---|---|---:|---:|---:|---:|---:|\n"]
+    for r in rows:
+        out.append("| %s | %s | %d | %s | %s | %s | %s |\n" % (
+            r["cell"], r["engine"], r["reps"],
+            fmt(r["vals"].get(list(LABELS)[0]), 1),
+            fmt(r["vals"].get(list(LABELS)[1]), 1),
+            fmt(r["vals"].get(list(LABELS)[2]), 1),
+            r["ios"]))
+    out.append("\nΔ（sluice-uring − io_uring，同 cell；正 = sluice 更贵）：\n\n")
+    out.append("| cell | Δinstr/op | Δinstr% | Δcycles/op | "
+               "Δcpu-us/op |\n|---|---:|---:|---:|---:|\n")
+    by_cell = {}
+    for r in rows:
+        by_cell.setdefault(r["cell"], {})[r["engine"]] = r
+    for cell in sorted(by_cell):
+        a = by_cell[cell].get("io_uring")
+        b = by_cell[cell].get("sluice-uring")
         if not a or not b:
             continue
-        def val(line, col):
-            fields = [x.strip() for x in line.split("|")]
-            cell = fields[3 + col]
-            return float(cell) if cell not in ("-", "") else None
-        try:
-            di = val(b, 0) - val(a, 0)
-            dc = val(b, 1) - val(a, 1)
-            du = (val(b, 2) or 0) - (val(a, 2) or 0)
-            out.append("| %s | %+.0f | %+.0f | %+.2f | - |\n"
-                       % (cell, di, dc, du))
-        except (TypeError, ValueError):
+        labels = list(LABELS)
+        av = [a["vals"].get(l) for l in labels]
+        bv = [b["vals"].get(l) for l in labels]
+        if None in av or None in bv:
             out.append("| %s | - | - | - | - |\n" % cell)
+            continue
+        out.append("| %s | %+.1f | %+.1f%% | %+.1f | %+.2f |\n" % (
+            cell, bv[0] - av[0], (bv[0] - av[0]) / av[0] * 100,
+            bv[1] - av[1], bv[2] - av[2]))
     return "".join(out)
 
 
@@ -88,7 +83,7 @@ def render_trace(norm: dict) -> str:
            "straced/bare IOPS | 扰动 |\n|---|---|---:|---:|---:|---:|---|\n"]
     for key, entry in sorted(norm.items()):
         bare = entry.get("trace-bare") or [{}]
-        straced = entry.get("trace-straced") or [{}]
+        straced = entry.get("trace-straced") or []
         if not straced:
             continue
         sc = (straced[0].get("syscalls") or {})
@@ -112,35 +107,65 @@ def render_trace(norm: dict) -> str:
 
 
 def render_perturbation(norm: dict) -> str:
-    out = ["| cell | engine | clean IOPS | pmu-run IOPS | record-run IOPS | "
-           "straced IOPS | 判读 |\n|---|---|---:|---:|---:|---:|---|\n"]
+    """Observer perturbation, computed from each mode's own fio JSON IOPS.
+    clean0 (ramp=0) is the reference: only its window matches the pmu and
+    record runs (all ramp=0). clean (ramp=2) is shown for reference but
+    ranks differently by construction."""
+    out = ["| cell | engine | clean0 IOPS (ref) | pmu vs clean0 | "
+           "record vs clean0 | trace-straced vs trace-bare |\n"
+           "|---|---|---:|---:|---:|---:|\n"]
     for key, entry in sorted(norm.items()):
-        clean = entry.get("clean") or {}
-        clean_vals = clean.get("iops_values") or []
+        clean0 = entry.get("clean0") or {}
+        vals = clean0.get("iops_values") or []
+        ref = sum(vals) / len(vals) if vals else None
+
         def mode_iops(mode):
             rows = entry.get(mode) or []
-            for r in rows:
-                if isinstance(r, dict) and r.get("iops"):
-                    return r["iops"]
-            return None
-        c = sum(clean_vals) / len(clean_vals) if clean_vals else None
-        p = mode_iops("pmu")
-        rec = mode_iops("record")
-        # trace rows: straced run iops
-        tr = entry.get("trace-straced") or []
-        t = tr[0].get("iops") if tr else None
+            iops = [r.get("iops") for r in rows
+                    if isinstance(r, dict) and r.get("iops")]
+            return sum(iops) / len(iops) if iops else None
 
-        def pct(x, ref):
-            if x is None or not ref:
+        def pct(x, base):
+            if x is None or not base:
                 return "-"
-            return "%+.1f%%" % ((x - ref) / ref * 100)
-        out.append("| %s | %s | %s | %s(%s) | %s(%s) | %s | stat/record/"
-                   "strace vs clean |\n" % (
-                       entry["cell"], entry["engine"],
-                       fmt(c, 0) if c else "-", fmt(p, 0) if p else "-",
-                       pct(p, c), fmt(rec, 0) if rec else "-",
-                       pct(rec, c), fmt(t, 0) if t else "-"))
+            return "%+.1f%%" % ((x - base) / base * 100)
+
+        pmu = mode_iops("pmu")
+        rec = mode_iops("record")
+        bare = mode_iops("trace-bare")
+        straced = mode_iops("trace-straced")
+        out.append("| %s | %s | %s | %s (%s) | %s (%s) | %s (%s) |\n" % (
+            entry["cell"], entry["engine"],
+            fmt(ref, 0) if ref else "-",
+            fmt(pmu, 0) if pmu else "-", pct(pmu, ref),
+            fmt(rec, 0) if rec else "-", pct(rec, ref),
+            fmt(straced, 0) if straced else "-", pct(straced, bare)))
     return "".join(out)
+
+
+def render_rusage(norm: dict) -> str:
+    """clean0 (ramp=0, window-matched) rusage per-op lines."""
+    lines = []
+    for key, entry in sorted(norm.items()):
+        clean0 = entry.get("clean0") or {}
+        rows = clean0.get("rusage_per_op") or []
+        if not rows:
+            continue
+        def mean(field):
+            vals = [r[field] for r in rows if r.get(field) is not None]
+            return sum(vals) / len(vals) if vals else None
+        ctx = mean("ctx_switches_per_op")
+        cpu_u = mean("cpu_user_us_per_op")
+        cpu_s = mean("cpu_sys_us_per_op")
+        cpu_t = mean("cpu_total_us_per_op")
+        lines.append("  - %s/%s：ctx-switch/op %.5f；CPU user/sys/total "
+                     "%.2f / %.2f / %.2f µs/op" % (
+                         entry["cell"], entry["engine"],
+                         ctx if ctx is not None else float("nan"),
+                         cpu_u if cpu_u is not None else float("nan"),
+                         cpu_s if cpu_s is not None else float("nan"),
+                         cpu_t if cpu_t is not None else float("nan")))
+    return "\n".join(lines) if lines else "  (no clean0 rusage rows)"
 
 
 def render_h(norm: dict, window: dict) -> str:
@@ -159,6 +184,7 @@ def fill_ledger(session_dir: pathlib.Path, ledger_path: pathlib.Path) -> None:
     text = ledger_path.read_text()
     text = text.replace("LEDGER_PLACEHOLDER", render_main(norm).strip())
     text = text.replace("TRACE_PLACEHOLDER", render_trace(norm).strip())
+    text = text.replace("RUSAGE_PLACEHOLDER", render_rusage(norm).strip())
     text = text.replace("PERTURBATION_PLACEHOLDER",
                         render_perturbation(norm).strip())
     text = text.replace("H_PLACEHOLDER", render_h(norm, window).strip())

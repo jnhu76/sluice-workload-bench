@@ -42,8 +42,12 @@ ramp=2s 与 Phase 1 基线口径一致（clean 不做 per-op PMU 归一）。
 - 同负载、`ramp_time=0`、非 time_based、`number_ios=`（定长）：短窗污染仅剩
   启动+teardown；io 数足够大时摊销误差 → 0。
 - 以 Option C 与 Option B 的每 op 差估计 B 的启动/收尾占比，写入
-  `window-contract.json` 的 `startup_share_bound`。若 |B−C|/B > 10%，本轮
-  所有 per-op 结论降级为 lifecycle-only，不外推稳定态。
+  `window-contract.json`（`per_engine.*.delta_pct_of_C`、
+  `startup_share_bound_pct`）。**逐引擎执行**（audit 修正：早期实现只对
+  io_uring 计算）。若某引擎 |B−C|/C > 10%，该引擎的 per-op 结论降级为
+  lifecycle-only，不外推稳定态；若差值方向与启动摊销相反（C2 更长却
+  per-op 更高），按 mode/timing 效应处理而非启动污染，其 per-op 值携带
+  该量级的跨模式不确定度。
 
 ### 拒绝项（本轮不使用）
 
@@ -81,7 +85,7 @@ ramp=2s 与 Phase 1 基线口径一致（clean 不做 per-op PMU 归一）。
 | --- | --- | --- | --- |
 | instructions/op | perf stat `instructions:u` | 进程生命周期 | lifecycle ios |
 | cycles/op | perf stat `cycles:u` | 同上 | 同上 |
-| CPU time/op | `task-clock:u` + rusage(u+s) | 同上 | 同上 |
+| CPU time/op | `task-clock:u`（= 进程树 user+sys，非 user-only；与 rusage(u+s) 精确吻合） | 同上 | 同上 |
 | ctx switches/op | perf `context-switches` + rusage nvcsw+nivcsw | 同上 | 同上 |
 | io_uring_enter/op | strace -c `io_uring_enter` 计数 | straced 进程 | 同 run 的 lifecycle ios |
 | futex/op | strace -c `futex` 计数 | 同上 | 同上 |

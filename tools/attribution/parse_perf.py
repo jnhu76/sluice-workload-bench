@@ -81,9 +81,12 @@ def parse_perf_report(raw: str) -> dict:
     """-> {"samples": int|None, "event_lines": [(pct, samples, symbol)],
            "overhead_note": str} -- SAMPLED data, marked as such."""
     samples = None
-    m = re.search(r"# Samples: (\d+) of event\s+'([^']+)'", raw)
+    # perf prints "10K" / "1M" for large counts -- expand the suffix.
+    m = re.search(r"# Samples: ([\d.]+)([KMG]?) of event\s+'([^']+)'", raw)
     if m:
-        samples = int(m.group(1))
+        mult = {"": 1, "K": 1000, "M": 1_000_000,
+                "G": 1_000_000_000}[m.group(2)]
+        samples = int(float(m.group(1)) * mult)
     event_lines = []
     in_table = False
     for line in raw.splitlines():

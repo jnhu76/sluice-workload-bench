@@ -16,41 +16,51 @@ import re
 
 
 def parse_strace_summary(raw: str) -> dict:
-    """strace -c footer -> {syscall: {"calls": int, "errors": int|None,
-    "seconds": float|None}}. The header/footer time columns are wall facts
-    of a perturbed run, not clean latencies."""
+    """strace -c footer -> {syscall: {"calls": int, "errors": int,
+    "seconds": float}}.
+
+    Column layout (classic -c):
+        % time  seconds  usecs/call  calls  errors  syscall
+    The errors column is blank when zero. The seconds column is wall time
+    inside a *perturbed* run -- counts are the product, times are not.
+    """
     syscalls: dict = {}
     for line in raw.splitlines():
         m = re.match(
-            r"\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)\s+(\d+)\s+(\S+)\s*(.*)$",
+            r"\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)\s+(\d*)\s+(\S+)\s*$",
             line)
-        if m:
-            seconds, _usec_per_call, _total_us, calls, errors, name = \
-                m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6)
-            try:
-                syscalls[name] = {"calls": int(calls),
-                                  "errors": int(errors),
-                                  "seconds": float(seconds)}
-            except ValueError:
-                continue
+        if not m:
+            continue
+        pct, seconds, usecs, calls, errors, name = m.groups()
+        if name == "total" or name.startswith("-"):
+            continue
+        syscalls[name] = {"calls": int(calls),
+                          "errors": int(errors or 0),
+                          "seconds": float(seconds),
+                          "pct_time": float(pct),
+                          "usecs_per_call": float(usecs)}
     return syscalls
 
 
 def parse_io_uring_enter_lines(raw: str) -> dict:
-    """Full strace lines of io_uring_enter -> to_submit distribution and
-    min-complete arguments: the H2 submission-shape evidence."""
+    """Full strace lines of io_uring_enter -> (to_submit, min_complete,
+    flags) distribution: the H2 submission-shape evidence. flags matter:
+    IORING_ENTER_GETEVENTS (2) marks a reaping enter, 0 a pure submit."""
     to_submit: dict = {}
     enters = 0
     for line in raw.splitlines():
         if "io_uring_enter(" not in line:
             continue
-        m = re.search(r"io_uring_enter\(\s*\d+,\s*(\d+),\s*(\d+)", line)
+        m = re.search(r"io_uring_enter\(\s*\d+,\s*(\d+),\s*(\d+)"
+                      r"(?:,\s*([^,)]+))?", line)
         if not m:
             continue
         enters += 1
-        key = (int(m.group(1)), int(m.group(2)))
+        flags = (m.group(3) or "?").strip()
+        key = "to_submit=%d,min_complete=%d,flags=%s" % (
+            int(m.group(1)), int(m.group(2)), flags)
         to_submit[key] = to_submit.get(key, 0) + 1
-    return {"enters": enters, "to_submit_min_complete": to_submit}
+    return {"enters": enters, "to_submit_min_complete_flags": to_submit}
 
 
 class JoinIntegrity:

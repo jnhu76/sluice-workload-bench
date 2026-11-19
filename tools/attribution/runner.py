@@ -39,8 +39,14 @@ CELLS = {
     "A2": {"rw": "randread", "bs": "4k", "iodepth": 16, "kind": "time_based"},
     "A3": {"rw": "read", "bs": "64k", "iodepth": 4, "kind": "time_based"},
     "A4": {"rw": "randread", "bs": "4k", "iodepth": 4, "kind": "time_based"},
-    "C2": {"rw": "randread", "bs": "4k", "iodepth": 16, "kind": "number_ios",
-           "number_ios": 5_000_000},
+    # Option C cross-check: working set stays 1G (same as A2) while the
+    # total transferred is 20G == 5.24M ios, giving a long, startup-
+    # amortized window (fio semantics: size = working set, io_size = total;
+    # number_ios is NOT usable here -- size bounds total bytes when
+    # time_based is off, which capped the first C2 attempt at 262144 ios
+    # and contaminated it with ~60% startup cost).
+    "C2": {"rw": "randread", "bs": "4k", "iodepth": 16, "kind": "io_size",
+           "io_size": "20G"},
 }
 DEFAULT_CELLS = ("A1", "A2", "A3", "A4")
 DEFAULT_ENGINES = ("io_uring", "sluice-uring", "sluice-threadpool")
@@ -247,6 +253,8 @@ class Session:
                 ramp = ramp_override
             lines += ["time_based=1", "runtime=%d" % runtime,
                       "ramp_time=%d" % ramp]
+        elif cell["kind"] == "io_size":
+            lines += ["io_size=%s" % cell["io_size"], "ramp_time=0"]
         else:
             lines += ["number_ios=%d" % cell["number_ios"],
                       "ramp_time=0"]
@@ -431,14 +439,21 @@ class Session:
 
     # -- modes --------------------------------------------------------------
 
-    def mode_clean(self, cells, engines, repeats: int = 3) -> None:
+    def mode_clean(self, cells, engines, repeats: int = 3,
+                   ramp: int | None = None) -> None:
+        """ramp=None keeps the Phase-1 baseline (self.ramp_s, mode label
+        "clean"); ramp=0 produces "clean0" grids whose rusage window
+        matches the io_bytes denominator (the only clean rows allowed to
+        carry per-op rusage numbers, per the window contract)."""
+        mode = "clean0" if ramp == 0 else "clean"
         for cell in cells:
             data = self.prep_file(cell, self.file_size)
             for engine in engines:
                 for rep in range(1, repeats + 1):
-                    job = "\n".join(self.job_lines(engine, data, cell)) + "\n"
+                    job = "\n".join(self.job_lines(
+                        engine, data, cell, ramp_override=ramp)) + "\n"
                     self.run_with_retry(
-                        "%s__%s__clean__rep%d" % (cell, engine, rep),
+                        "%s__%s__%s__rep%d" % (cell, engine, mode, rep),
                         job_text=job,
                         expect_backend=engine_specs()[engine][1] or None)
 
@@ -565,24 +580,29 @@ class Session:
                         expect_backend=engine_specs()[engine][1] or None,
                         timeout_s=600)
 
-    def mode_crosscheck(self, engines) -> None:
-        """Option C: fixed number_ios, ramp 0 (window contract cross-check).
-        A2 shape only, per pre-registration."""
+    def mode_crosscheck(self, engines, clean_reps: int = 3,
+                        pmu_reps: int = 2) -> None:
+        """Option C: fixed io_size, ramp 0 (window contract cross-check).
+        A2 shape only, per pre-registration. Repeats match the main-grid
+        rule (clean x3, pmu x2) so the C2 side carries a variance, not a
+        single-run point."""
         data = self.prep_file("C2", self.file_size)
         for engine in engines:
             job = "\n".join(self.job_lines(engine, data, "C2")) + "\n"
-            self.run_with_retry(
-                "C2__%s__clean__rep1" % engine, job_text=job,
-                expect_backend=engine_specs()[engine][1] or None,
-                timeout_s=600)
-            run_id = "C2__%s__pmu__rep1" % engine
-            wrap = ["perf", "stat", "-x,",
-                    "-o", str(self.runs_dir / run_id /
-                              "perf-stat.raw.txt"),
-                    "-e", ",".join(cap.MAIN_EVENTS)]
-            self.run_with_retry(run_id, job_text=job, wrap=wrap,
-                                expect_backend=engine_specs()[engine][1]
-                                or None, timeout_s=600)
+            for rep in range(1, clean_reps + 1):
+                self.run_with_retry(
+                    "C2__%s__clean__rep%d" % (engine, rep), job_text=job,
+                    expect_backend=engine_specs()[engine][1] or None,
+                    timeout_s=600)
+            for rep in range(1, pmu_reps + 1):
+                run_id = "C2__%s__pmu__rep%d" % (engine, rep)
+                wrap = ["perf", "stat", "-x,",
+                        "-o", str(self.runs_dir / run_id /
+                                  "perf-stat.raw.txt"),
+                        "-e", ",".join(cap.MAIN_EVENTS)]
+                self.run_with_retry(run_id, job_text=job, wrap=wrap,
+                                    expect_backend=engine_specs()[engine][1]
+                                    or None, timeout_s=600)
 
     # -- archive ----------------------------------------------------------
 
