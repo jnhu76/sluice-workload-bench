@@ -98,24 +98,43 @@ def probe_perf_record(env=None) -> dict:
         return {"status": "UNAVAILABLE", "reason": "perf binary not found",
                 "evidence": "which perf -> not found"}
     import tempfile
+
+    def record_ok(receipt: dict, data: pathlib.Path) -> bool:
+        # perf record exits 0 even when it fails to open events (observed
+        # on perf 7.3.3, paranoid=2, --call-graph): judge by output text
+        # AND produced samples, never by exit code alone.
+        text = receipt["stdout"] + receipt["stderr"]
+        if "Failure to open" in text or "Error" in text:
+            return False
+        return receipt["returncode"] == 0 and data.exists() \
+            and data.stat().st_size > 0
+
     with tempfile.TemporaryDirectory() as tmp:
         data = pathlib.Path(tmp) / "probe.data"
         receipt = _run([perf, "record", "-o", str(data), "-e", "cycles:u",
                         "-F", "99", "--", "/bin/true"], env=env)
-        ok = receipt["returncode"] == 0 and data.exists()
+        ok = record_ok(receipt, data)
         report = _run([perf, "report", "-i", str(data), "--stdio",
                        "--percent-limit", "0"], env=env)
         symbols = any(s in report["stdout"] for s in ("true", "ld.so", "_start"))
-        dwarf = _run([perf, "record", "-o", str(data), "-e", "cycles:u",
-                      "-F", "99", "--call-graph", "dwarf", "--", "/bin/true"],
+        graphs = {}
+        for kind in ("dwarf", "fp"):
+            data.unlink(missing_ok=True)
+            r = _run([perf, "record", "-o", str(data), "-e", "cycles:u",
+                      "-F", "99", "--call-graph", kind, "--", "/bin/true"],
                      env=env)
-        status = "SUPPORTED" if ok and symbols else (
-            "PARTIAL" if ok else "UNAVAILABLE")
+            graphs[kind] = {"ok": record_ok(r, data), "receipt": r}
+        status = ("SUPPORTED" if ok and symbols
+                  else "PARTIAL" if ok else "UNAVAILABLE")
         return {"status": status,
                 "reason": "" if ok else "record failed",
-                "dwarf_callgraph": dwarf["returncode"] == 0,
-                "evidence": {"record": receipt, "report_head":
-                             report["stdout"][:2000]}}
+                "callgraph_dwarf": graphs["dwarf"]["ok"],
+                "callgraph_fp": graphs["fp"]["ok"],
+                "callgraph_note": "perf record exits 0 even on event-open "
+                                  "failure; judged from output text",
+                "evidence": {"record": receipt,
+                             "callgraph": graphs,
+                             "report_head": report["stdout"][:2000]}}
 
 
 def probe_sudo_root() -> dict:

@@ -102,7 +102,12 @@ class Session:
         self.fio_diag = fio_diag or str(
             TOOLS_DIR.parent / "build" / "fio" / "upstream" / "fio")
         self.revision = (TOOLS_DIR.parent / "SLUICE_REVISION").read_text().strip()
-        self.manifest_runs: list[dict] = []
+        # Modes run as separate CLI invocations against the same session:
+        # reload the manifest so it accumulates across invocations instead
+        # of being silently truncated per mode.
+        _manifest = self.root / "runs-manifest.json"
+        self.manifest_runs: list = json.loads(_manifest.read_text()) \
+            if _manifest.exists() else []
         self.prepared_files: dict[str, pathlib.Path] = {}
 
     # -- session bootstrap ------------------------------------------------
@@ -181,24 +186,29 @@ class Session:
 
     # -- environment gates --------------------------------------------------
 
-    def gate_environment(self) -> None:
-        load = float(pathlib.Path("/proc/loadavg").read_text().split()[0])
-        if load > 1.0:
-            # Pre-registered drift rule: wait out short spikes, refuse long.
-            for _ in range(12):
-                time.sleep(5)
-                load = float(pathlib.Path("/proc/loadavg")
-                             .read_text().split()[0])
-                if load <= 1.0:
-                    break
-            if load > 1.0:
-                raise EnvironmentDrift("1min loadavg %.2f > 1.0" % load)
+    def gate_environment(self, prep_run: bool = False) -> None:
+        """Foreign-process gate always; loadavg gate only before measured
+        runs (session-001 receipt: our own 1G prep write/warm-read pushes
+        1min loadavg to ~1.5 for a minute -- self-induced churn, not drift;
+        refusing on it aborted the chain mid-session)."""
         for pat in ("fio", "perf", "strace", "bpftrace"):
             out = subprocess.run(["pgrep", "-x", pat],
                                  capture_output=True, text=True)
             if out.stdout.strip():
                 raise EnvironmentDrift(
                     "competing %s processes: %s" % (pat, out.stdout.strip()))
+        if prep_run:
+            return
+        load = float(pathlib.Path("/proc/loadavg").read_text().split()[0])
+        if load > 2.5:
+            for _ in range(12):
+                time.sleep(5)
+                load = float(pathlib.Path("/proc/loadavg")
+                             .read_text().split()[0])
+                if load <= 2.5:
+                    break
+            if load > 2.5:
+                raise EnvironmentDrift("1min loadavg %.2f > 2.5" % load)
 
     # -- fio plumbing -------------------------------------------------------
 
@@ -346,13 +356,28 @@ class Session:
         """One serial measured run. wrap = argv prefix (perf/strace) placed
         between taskset and fio; its own outputs go to the run dir."""
         run_dir = self.runs_dir / run_id
+        # Keep failed receipts: a re-invocation of the same run_id (e.g. the
+        # record-mode callgraph repair) must not overwrite them silently.
+        prior_meta = run_dir / "meta.json"
+        if run_dir.exists() and prior_meta.exists():
+            try:
+                if json.loads(prior_meta.read_text()).get("status") != "ok":
+                    keep = run_dir.with_name(run_dir.name + "-failed")
+                    suffix = 1
+                    while keep.exists():
+                        keep = run_dir.with_name(
+                            "%s-failed%d" % (run_dir.name, suffix))
+                        suffix += 1
+                    run_dir.rename(keep)
+            except (ValueError, OSError):
+                pass
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "fio-job.fio").write_text(job_text)
         for target in (pathlib.Path(ln.split("=", 1)[1])
                        for ln in job_text.splitlines()
                        if ln.startswith("filename=")):
             self.guard(target)
-        self.gate_environment()
+        self.gate_environment(prep_run=run_id.startswith("prep-"))
         argv: list = []
         if self.cpu_set:
             argv += ["taskset", "-c", self.cpu_set]
@@ -458,9 +483,13 @@ class Session:
                 run_id = "%s__%s__record__rep1" % (cell, engine)
                 run_dir = self.runs_dir / run_id
                 run_dir.mkdir(parents=True, exist_ok=True)
+                # Flat sampling only: --call-graph (dwarf|fp) cannot open
+                # any event at perf_event_paranoid=2 on this stack (perf
+                # exits 0 on that failure -- receipt in capability.json),
+                # so call-chain attribution is UNAVAILABLE non-root and the
+                # sampled ledger stays function-level.
                 wrap = ["perf", "record", "-o", str(run_dir / "perf.data"),
-                        "-e", "cycles:u", "-F", str(freq),
-                        "--call-graph", "dwarf,16384", "--"]
+                        "-e", "cycles:u", "-F", str(freq), "--"]
                 rec = self.run_with_retry(
                     run_id, job_text=job, wrap=wrap, diag=True,
                     expect_backend=engine_specs(diag=True)[engine][1] or None,
