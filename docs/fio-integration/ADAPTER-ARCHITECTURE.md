@@ -1,6 +1,8 @@
 # Phase 2 最小引擎架构设计（fio external ioengine × Sluice v2 公共 API）
 
-- 状态：**设计定稿（未实现）**。本文只写设计；实现代码由后续阶段落地。
+- 状态：设计定稿；**实现已交付**（见 `adapters/fio/README.md` 与
+  PHASE1-REPORT §C–§F；本文保留设计时表述，落地偏差以
+  adapters/fio/README.md §3 为准）。
 - 日期：2026-11-19。分支：`feat/fio-sluice-engine`（与 `main` 同基 `2abda4d`）。
 - 输入材料（本文全部结论的出处）：
   - `docs/fio-integration/REPOSITORY-REALITY.md`（Phase 0 审计，下称 REALITY）；

@@ -293,8 +293,10 @@ xmake check-ring                          # 显式触发 bench 功能检查（�
 
 ### G.1 一句话结论
 
-性能门 = **BASELINE_VALID**：读为主的 F1/F2/F4 上四引擎数字可信（A/A 噪声界内、rep spread
-≤11%）；F3（写混）因 SATA SSD SLC 缓存耗尽**不支持跨引擎排名**（按方法论预先声明，非事后修饰）。
+性能门 = **BASELINE_VALID（范围：EXPLORATORY_F1_F2_F4）**：读为主的 F1/F2/F4 上四引擎数字
+可信（rep spread ≤11%，判读用逐 rep 值而非普适阈值——A/A 仅为 psync/sluice-TP 各两次重复的
+OBSERVED_TWO_REPEAT_SPREAD）；F3（写混）为 F3_ENVIRONMENT_CONFOUNDED（SATA SSD SLC 缓存
+耗尽）不支持跨引擎排名（按方法论预先声明，非事后修饰）。
 
 ### G.2 A/A 一致性（F2 形态、10s 窗、两次同配置重复）
 
@@ -303,20 +305,24 @@ xmake check-ring                          # 显式触发 bench 功能检查（�
 | psync（native） | 788149 / 775290 | 1.65 | 1.22 |
 | sluice-threadpool | 220629 / 202952 | 8.35 | 6.76 |
 
-机器+fio 原生链路噪声底 ≈1.6%；含引擎整链路 ≈8%。判读规则：native 引擎间 <5%、sluice 引擎间
-<10% 的差异视为噪声（PERF-BASELINE.md:46-56；本次复验 compare.json `aa` 节数字一致）。
+上述 Δ 为 psync 与 sluice-TP 各两次重复的 OBSERVED_TWO_REPEAT_SPREAD（1.65%/8.35%），
+INSUFFICIENT_FOR_GENERAL_NOISE_THRESHOLD：不覆盖 native io_uring/sluice-uring（无 A/A
+对），不是最小可检测效应、不是 95% 区间、不成立为普适 <5%/<10% 判读规则；判读以逐 rep 值
+呈现（PERF-BASELINE.md §2；本次复验 compare.json `aa` 节数字一致）。
 
 ### G.3 F1–F4 × 四引擎（两 repeats 均值；热缓存；direct=0；randseed=81；完整表见 PERF-BASELINE.md 数据区）
 
 | case | psync | io_uring (native) | sluice-uring | sluice-TP |
 | --- | ---: | ---: | ---: | ---: |
-| F1 4k randread D1 (IOPS) | 785.8k | 616.0k | **422.5k (0.69× native)** | 39.2k（futex 挥手串行化） |
+| F1 4k randread D1 (IOPS) | 785.8k | 616.0k | **422.5k (0.69× native)** | 39.2k（futex 挥手串行化†） |
 | F2 4k randread D16 | 789.5k (D1-capped) | 618.9k | 368.0k (0.59×) | 211.6k |
 | F3 4k randrw 70/30 D16 | 4.6k | 5.9k（rep spread 177%） | 98.1k（spread 1.9%） | 27.9k（spread 191%） |
 | F4 64k seqread D4 | 158.1k (D1-capped) | 126.9k | 117.3k (0.92×) | **211.0k（四者最高，13.8GB/s）** |
 
-F3 整行环境受限（SLC 耗尽区），只有 sluice-uring 的稳定性本身是可报告观察。psync 为同步引擎，
-D16/D4 被 fio 钳到 D1（引擎语义，如实记录）。
+F3 整行为 F3_ENVIRONMENT_CONFOUNDED（SLC 耗尽区），只有 sluice-uring 的稳定性本身是可报告
+观察。psync 为同步引擎，D16/D4 被 fio 钳到 D1（引擎语义，如实记录）。†机制表述：futex
+握手成本的定量依据见 §H/PERF-BASELINE §5（UNVERIFIED_EXPLORATORY_ATTRIBUTION），
+ctx/kiop 旁证为已归档原件。
 
 ### G.4 环境资格与 JSON 原件索引
 
@@ -333,18 +339,23 @@ D16/D4 被 fio 钳到 D1（引擎语义，如实记录）。
 
 ## H. Attribution（详见 PERF-BASELINE.md §5）
 
-- **无隐藏 POSIX fallback**（syscall 层实证）：sluice-uring 短跑 strace 仅 `io_uring_enter`
-  （61.4k 次 ≈ 1 次/IO）；sluice-TP 仅 `pread64`（74.0k ≈ 1 次/IO）。正式矩阵另有引擎 load 行
-  强校验（backend 与请求一致）。
-- **每 IO 用户态指令**：native psync ~2.4k、native io_uring ~2.9k；sluice-uring ~7.9k、
-  sluice-TP ~8.9k → adapter+Sluice 层多 ~5–6k 用户态指令/IO（≈3× native driver 成本），
-  与 sluice-uring 达 native 0.59–0.69× 相称——差距是真实机器工作，不是阻塞或等待。
-- **TP 的成本在 futex 挥手不在指令**：task-clock 3.2×、每 IO ~3.4 次 futex、F2 CPU 41.4s vs
-  其他 12.2s、ctx/kiop 10³ 倍量级——Sluice 产品侧 ThreadPool 属性，非 adapter 引入；
-  D4 大块流水化后反超（F4 最高）。
+- **无隐藏 POSIX fallback**（syscall 层观察，短跑计数为 UNVERIFIED_EXPLORATORY_ATTRIBUTION；
+  strace 未见额外 syscall 不代表不存在用户态开销）：sluice-uring 短跑 strace 仅
+  `io_uring_enter`（61.4k 次 ≈ 1 次/IO）；sluice-TP 仅 `pread64`（74.0k ≈ 1 次/IO）。
+  已归档旁证：正式矩阵引擎 load 行强校验 50/50 一致（backend 与请求一致）。
+- **每 IO 用户态指令（UNVERIFIED_EXPLORATORY_ATTRIBUTION，数字保留原读数）**：native psync
+  ~2.4k、native io_uring ~2.9k；sluice-uring ~7.9k、sluice-TP ~8.9k → adapter+Sluice 组合层
+  约多 ~5–6k 用户态指令/IO（≈3× native driver 成本；组合开销，不能独立推断 Adapter 净
+  开销），与 sluice-uring 达 native 0.59–0.69×（已归档）方向相容——"真实机器工作而非阻塞"
+  为待复核解释，不作为产品性能裁决依据。
+- **TP 的成本在 futex 挥手不在指令（短跑计数未归档；F2 CPU 41.4s vs 12.2s 与 ctx/kiop 10³
+  倍量级来自已归档 manifest rusage）**：task-clock 3.2×（未归档回执）、每 IO ~3.4 次 futex
+  （未归档回执）、F2 CPU 41.4s vs 其他 12.2s、ctx/kiop 10³ 倍量级——Sluice 产品侧
+  ThreadPool 属性，非 adapter 引入；D4 大块流水化后反超（F4 最高）。
 - **kernel 侧计数不可得**（perf_event_paranoid=2）：内核态周期分解是环境限制，以 syscall 计数 +
   用户态指令 + rusage 旁证完成。
-- 结论：适配层未发现严重阻塞、重复遍历或缓冲拷贝。
+- 结论（探索性）：在未归档回执所示采样内未观察到严重阻塞、重复遍历或缓冲拷贝特征（strace
+  未见额外 syscall 不代表不存在用户态开销）；不作为产品性能裁决依据。
 
 ---
 
@@ -397,8 +408,9 @@ D16/D4 被 fio 钳到 D1（引擎语义，如实记录）。
 1. **fio 是否真经 Sluice 执行 I/O？** 是。引擎 .so 链入 Sluice 静态库（`nm -D` 15 个 sluice
    定义符号，§E.4），提交走 `RequestScope::submit_read/write`（`queue.cpp:89-121`），strace 显示
    sluice-uring 仅 io_uring_enter、sluice-TP 仅 pread64（PERF-BASELINE.md §5），引擎 load 行与
-   请求 backend 强校验一致（PERF-BASELINE.md:177）。无 POSIX 直通路径（未定义符号集里没有
-   pread/pwrite 引用，§E.4）。
+   请求 backend 强校验一致（PERF-BASELINE.md:177）。无 POSIX 直通路径（adapter 源码 grep 无
+   pread/pwrite 调用；两个 .so 的未定义符号集确有 `pread/pwrite@GLIBC`——它们来自所链接的
+   Sluice SDK（TP 后端实现），非 adapter 代码，运行时证据见 §5 strace，见 §E.4）。
 2. **TP/uring 是否都可用？** 是。正确性矩阵 threadpool 与 uring 双臂各 90/90 通过
    （`correctness.json`、`correctness-uring.json`，本次复验 summary 均 90/0/0）；noring 引擎 +
    uring 请求 fail closed 无回退（负控制实测 exit 77/exit 1，CORRECTNESS-MATRIX.md:10-11）。
@@ -416,13 +428,18 @@ D16/D4 被 fio 钳到 D1（引擎语义，如实记录）。
    引擎不实现 cancel（借出安全优先，fio 侧退化为阻塞排空，§D.5）；shutdown：两 tier 结算路径
    在（Tier 2 的进程终止路径未在正矩阵中触发——按设计，触发即 fail closed）。
 6. **POSIX/fio io_uring/fio-sluice 同 workload 对照是否可信？** 有条件可信。同 randseed=81、
-   同文件、同 runtime/亲和、A/A 划出噪声界（1.6%/8%）、F3 不可比性预先声明不混排、envelope
-   对照明示非严格 A/B（PERF-BASELINE.md §2/§3/§4）。F3 行不用于跨引擎结论（§G.3）。
-7. **adapter 是否成为主要瓶颈？** 非"阻塞型"瓶颈。适配+Sluice 层 ~5–6k 用户态指令/IO 是可归因
-   的真实成本；未发现阻塞/重复遍历/拷贝特征；TP 后端的 futex 挥手是 Sluice 产品侧属性而非
-   adapter 引入（§H）。
+   同文件、同 runtime/亲和、A/A 提供 psync/sluice-TP 各两次重复的
+   OBSERVED_TWO_REPEAT_SPREAD（1.6%/8.35%，INSUFFICIENT_FOR_GENERAL_NOISE_THRESHOLD）、
+   F3 不可比性预先声明不混排、envelope 对照明示非严格 A/B（PERF-BASELINE.md §2/§3/§4）。
+   F3 行不用于跨引擎结论（§G.3）。
+7. **adapter 是否成为主要瓶颈？** 在探索性归因内非"阻塞型"瓶颈。适配+Sluice 组合层 ~5–6k
+   用户态指令/IO 来自未归档回执（UNVERIFIED_EXPLORATORY_ATTRIBUTION；不能独立推断 Adapter
+   净开销）；未观察到阻塞/重复遍历/拷贝特征（strace 未见额外 syscall 不代表不存在用户态
+   开销）；TP 后端的 futex 挥手是 Sluice 产品侧属性而非 adapter 引入（§H，含已归档 rusage
+   旁证）。
 8. **E5 上能否稳定重复？** 读为主场景可以：除 F1/io_uring（11.0%）与 F2/sluice-uring（6.7%）外
-   rep spread ≤3.7%，远小于引擎间差距；含引擎链路 A/A ≈8%（§G.2）。F3 受盘状态支配会漂移，
+   rep spread ≤3.7%，远小于引擎间差距；含引擎链路（sluice-TP）两次重复
+   OBSERVED_TWO_REPEAT_SPREAD ≈8%（§G.2）。F3 受盘状态支配会漂移，
    已声明（§G.3）。
 9. **是否具备引入真实应用 trace 的基础？** 具备载体、尚无 trace 机制。fio 生态（含本引擎）可
    作为统一四引擎执行 substrate；但当前负载仍是参数化合成分布，trace 采集/回放（如 fio 的
@@ -440,7 +457,7 @@ D16/D4 被 fio 钳到 D1（引擎语义，如实记录）。
 | Gate | 要求 | 本阶段位置 |
 | --- | --- | --- |
 | **G0 Workload admission** | Real consumer or defensible representative trace；frozen oracle/dependencies、budgets、baseline | **未进入**。见下。 |
-| G1 Cost attribution | 实际瓶颈与必要/可避免工作，竞争性解释 | 部分供料：四引擎基线 + 用户态指令/futex/syscall 归因（§H）只是 G1 的**方法预演**，对象是合成负载 |
+| G1 Cost attribution | 实际瓶颈与必要/可避免工作，竞争性解释 | 部分供料：四引擎基线 + 用户态指令/futex/syscall 归因（§H；计数回执未归档，UNVERIFIED_EXPLORATORY_ATTRIBUTION）只是 G1 的**方法预演**，对象是合成负载 |
 | G2 Mechanism trial | 隔离 A/B + 因果反事实 | 未进入。本基线是观察性对照，不是机制试验 |
 | G3 Transferability | 端到端 + 邻近 regime + 硬件敏感性 | 未进入 |
 | G4 Product promotion | 为何进 Sluice vs 应用/adapter | 未进入；且本引擎的存在本身是"留在 adapter 层"的例证 |
@@ -471,8 +488,9 @@ D16/D4 被 fio 钳到 D1（引擎语义，如实记录）。
 独立终审 = **conditional**（无遗留 high 的前提下）。
 
 **建议判词：`PHASE1_CONDITIONAL_GO`** —— fio-sluice 外部引擎构建、冒烟、正确性矩阵（90/90 ×
-两种调用形态）与回归全部通过；四引擎性能基线有效（F1/F2/F4 可信、F3 环境受限已声明、A/A 划出
-噪声界）；受限项（§I 全表：TRIM/verify_async/offload 不支持、fio 3.40 精确钉死、numjobs=1、
+两种调用形态）与回归全部通过；四引擎性能基线有效（EXPLORATORY_F1_F2_F4：F1/F2/F4 可信、
+F3_ENVIRONMENT_CONFOUNDED 已声明、A/A 为 psync/sluice-TP 两次重复的观测极差而非普适噪声界）；
+受限项（§I 全表：TRIM/verify_async/offload 不支持、fio 3.40 精确钉死、numjobs=1、
 direct=1 未测、F3 不可排名、结果原件不入库）均已明示。放行的是"以本引擎为 substrate 推进
 #604 G0 workload admission 准备"；不放行 synthetic 基线作为 G0 准入本身，不放行任何 G2 机制
 试验。最终 Owner Gate 由人裁定。

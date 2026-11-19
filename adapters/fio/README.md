@@ -95,7 +95,10 @@ init 时打印一行版本串供对账。
 - `REQUIRE_URING=1 bash adapters/fio/tests/smoke.sh`：uring 不可用 → 打印
   `UNAVAILABLE: <原因>` 并 **exit 77**，绝不回退 TP；不带 REQUIRE_URING 时
   uring 项打印记录并跳过，其余必须通过（两种分支均已实测）。
-- 测量矩阵工具（`run_fio_matrix.py` 等）属后续阶段，尚未实现。
+- 测量矩阵工具已交付：`tools/run_fio_matrix.py`（串行正式矩阵，A/A 仅
+  psync/sluice-TP×2 repeats）与 `tools/compare_fio.py`（汇总 + envelope +
+  交叉核对，写入 PERF-BASELINE.md 数据表）；实测记录见 PERF-BASELINE.md 与
+  `results/fio/`（git-ignored 工作区证据）。
 
 ## 5. 实测记录（2026-11-19，本分支）
 

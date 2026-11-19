@@ -97,8 +97,13 @@ ships in this open repository.
 
 ## Initial performance matrix (E5 host, serial formal run, 2026-11-19)
 
-A/A noise floor: psync ΔIOPS **1.65%**, sluice-threadpool **8.35%**
-(same-config repeats). Numbers below are means of 2 repeats (hot page cache,
+A/A OBSERVED_TWO_REPEAT_SPREAD (two same-config repeats, psync and
+sluice-threadpool only — no A/A pair exists for native io_uring or
+sluice-uring): psync ΔIOPS **1.65%**, sluice-threadpool **8.35%**.
+INSUFFICIENT_FOR_GENERAL_NOISE_THRESHOLD: these are two-repeat spreads, not
+engine-family noise floors, not a minimum detectable effect, not 95%
+intervals, and not general 5%/10% rules. Numbers below are means of 2
+repeats (hot page cache,
 direct=0, randseed=81, 10 s + 2 s ramp, `taskset 0-9`); full tables, per-rep
 values and environment qualification in
 [`PERF-BASELINE.md`](../fio-integration/PERF-BASELINE.md) (auto-generated
@@ -111,15 +116,25 @@ from the 50 fio JSON originals under `results/fio/`, cross-checked 50/50).
 | F3 randrw 70/30 4k D16 | 4.6k | 5.9k | 98.1k | 27.9k |
 | F4 seqread 64k D4 | 158.1k (D1-capped) | 126.9k | 117.3k (0.92×) | **211.0k (best, 13.8 GB/s)** |
 
-- **F1/F2/F4 are valid baselines**; rep spreads ≤ 11% and far below
-  engine-to-engine deltas.
-- **F3 does not support cross-engine ranking on this substrate** (SATA SSD
-  SLC-cache exhaustion dominates; declared before the formal run, reported
-  per-rep rather than hidden behind a mean).
-- Attribution (user-space instructions, syscall counts, futex profile): the
-  adapter + Sluice layer costs ~5–6k user instructions/IO; no blocking,
-  double-traversal, or copy signature; ThreadPool's futex handshake is a
-  Sluice-backend property, not adapter overhead. See PERF-BASELINE.md §5.
+- **F1/F2/F4 are EXPLORATORY_F1_F2_F4 exploratory baselines** (numbers are
+  the archived record); rep spreads ≤ 11% and, where engine-to-engine deltas
+  are far larger, interpreted per-rep rather than via a universal threshold.
+- **F3 does not support cross-engine ranking on this substrate**
+  (F3_ENVIRONMENT_CONFOUNDED: SATA SSD SLC-cache exhaustion dominates;
+  declared before the formal run, reported per-rep rather than hidden
+  behind a mean).
+- Attribution (UNVERIFIED_EXPLORATORY_ATTRIBUTION — figures come from an
+  earlier measurement session whose perf/strace receipts were never
+  archived; no independent raw-counter recheck this round; not a basis for
+  product performance verdicts): user-space instruction counts (native
+  psync ~2.4k, native io_uring ~2.9k, sluice-uring ~7.9k, sluice-TP ~8.9k
+  per IO) suggest ~5–6k extra user instructions/IO, but adapter + Sluice is
+  a combined cost — the adapter's net overhead cannot be inferred
+  separately; no blocking/double-traversal/copy syscall signature was
+  observed (absence of extra syscalls does not rule out user-space
+  overhead); ThreadPool's futex handshake is a Sluice-backend property, not
+  adapter overhead (this side has archived rusage/ctx corroboration). See
+  PERF-BASELINE.md §5.
 
 ## Known limitations (all stated in-repo, PHASE1-REPORT §I)
 
@@ -170,9 +185,11 @@ seqread with a fixed seed): no real consumer, no application dependency
 structure, no application-level oracle or arrival process. **Therefore this
 PR does not claim G0 admission, and its numbers are not G0 evidence.**
 
-What it does provide for #604: a comparable, attributable measurement
-substrate — four engines executing identical work under one harness, with
-adapter-layer costs quantified — as groundwork for G0 admission preparation
+What it does provide for #604: a comparable measurement substrate — four
+engines executing identical work under one harness, with adapter+Sluice
+combined overhead indicated by unarchived-receipt exploratory attribution
+(UNVERIFIED_EXPLORATORY_ATTRIBUTION, see above) — as groundwork for G0
+admission preparation
 and as a methods preview for G1 cost attribution. Proceeding to a real G0
 admission (trace capture from a real consumer, frozen oracles) is the
 recommended next step. #578 (fio + DuckDB R0 admission), #617 (kernel
@@ -182,3 +199,83 @@ respective gates; this bench repository's engine does not bypass them.
 Suggested review order: PHASE1-REPORT.md §J (ten questions + verdict
 rationale) → `adapters/fio/README.md` → engine sources
 (`adapters/fio/src/`, ~900 LOC) → tooling under `tools/`.
+
+## Review repair round (r2)
+
+Range: BASE `bea54ac8` → fixes `ed8ca4f` (close invariant) and
+`3e995c5` (init containment), tests `3734974`, docs/tool revisions and
+the repair ledger in the final commit of this PR. No merge performed —
+Owner Merge Gate.
+
+### Code fixes (accepted in r2, receipts archived)
+
+1. **close_file fd lifetime (Plan A, fail closed).** A frozen-fio-3.40
+   source audit established that close-with-in-flight is unreachable via
+   legal fio sequences: `close_file` fires only from `put_file` when
+   `f->references == 0` (filesetup.c:1898, 1912-1913), every io_u holds a
+   file reference from `set_io_u_file` (io_u.c:1488) until reaped in
+   `put_io_u` (io_u.c:855-856, after IO_U_F_FLIGHT clears at io_u.c:2103),
+   and `td_io_close_file` defers the real close until the last io completes
+   (ioengines.c:636-641). A live slot at close_file therefore means an
+   engine bookkeeping bug; closing anyway could misdirect still-borrowed
+   I/O to a reused fd number, and returning an error without closing
+   violates `put_file`'s `f->fd == -1` post-condition (filesetup.c:1921).
+   `sluice_close_file` now logs and `std::terminate()`s — the same
+   fail-closed idiom already used by the slot-accounting path and
+   `fail_closed()` (adapters/fio/src/files.cpp).
+2. **init exception containment.** `sluice_init` previously had
+   `make_unique<EngineState>` before its try block and the slot-vector
+   setup after the catch handlers, so an allocation failure there escaped
+   the C callback. All throwing initialization now sits in one try block;
+   a `unique_ptr` owns the state until success (`state.release()` only on
+   the success tail, which is unchanged), and failure logs and returns 1
+   with full RAII rollback (scope-before-context teardown per the
+   EngineState member order) (adapters/fio/src/engine.cpp).
+
+### Deterministic tests (new `fio-sluice-lifecycle-test`)
+
+The test links the real engine TUs against stub fio-core callbacks (the
+five symbols fio_cxx.hpp declares) and compiles the engine with a
+test-only `SLUICE_FIO_INIT_SEAM` hook (compiled out of both shipped .so
+profiles — verified by `nm`).
+
+- **T1 — close-with-in-flight (contract guard).** The audited fio 3.40
+  refcount gate makes the violated state unreachable through real fio, so
+  T1 invokes the callback synthetically: normal close, borrow on a
+  different file, staged-completion non-blocking, and a forked violation
+  child whose pipe EOF (the stub closer never ran) plus SIGABRT are the
+  receipt.
+- **T2 — init allocation failure.** A 4-variant matrix (steps 0/1/2 ×
+  `std::bad_alloc`, plus a non-std exception type at step 1 to exercise
+  `catch(...)`) asserts: failed init returns 1, `td->io_ops_data` stays
+  null, and an in-process re-init on the same td then succeeds and cleans
+  up — proving no leaked progress owner.
+- **RED receipt (unfixed engine):** T1's violation child actually closed
+  the borrowed fd (stub wrote 'X', child exited 42 → parent FAIL lines);
+  T2 died with `terminate called after throwing an instance of
+  'std::bad_alloc'` escaping the C callback; exit 134.
+- **GREEN receipt (fixed engine):** `close_file invariant violated: fd 3
+  still has in-flight request(s); failing closed` → SIGABRT with zero
+  bytes on the pipe (closer never ran); all T2 variants contained
+  (return 1, no state published, re-init ok); `lifecycle_test: PASS`,
+  exit 0. Raw logs: `results/fio/lifecycle/{red,green}-t1t2.log`.
+
+### Findings disposition
+
+| Finding | Disposition |
+| --- | --- |
+| R-F1 root README make→xmake drift | RESOLVED before this round (commit `a9a9fd8`; verified at `bea54ac8`; not re-modified) |
+| close_file in-flight borrow | RESOLVED (Plan A fail-closed + T1) |
+| init exception escape | RESOLVED (single-try containment + T2) |
+| doc drift ×2 (adapters README, ADAPTER-ARCHITECTURE status) | RESOLVED |
+| PMU/instruction attribution receipts never archived | QUALIFIED — downgraded to UNVERIFIED_EXPLORATORY_ATTRIBUTION (numbers kept, caveats added) |
+| A/A scope (psync/sluice-TP only, 2 repeats) | QUALIFIED — downgraded to OBSERVED_TWO_REPEAT_SPREAD / INSUFFICIENT_FOR_GENERAL_NOISE_THRESHOLD |
+
+### r2 regression gates (all green)
+
+All gates re-run at HEAD `bea54ac8` with the fixes in the working tree:
+six `xmake build` targets = 0; `smoke.sh` = 0; `REQUIRE_URING=1 smoke.sh`
+= 0; `check_fio_engine.py --require-uring` = 0 (90/90/0 →
+`results/fio/correctness-review-r2.json`); `xmake check` = 0; `xmake
+check-ring` = 0. Full ledger with binary hashes:
+[`REVIEW-REPAIR-LEDGER.md`](REVIEW-REPAIR-LEDGER.md).

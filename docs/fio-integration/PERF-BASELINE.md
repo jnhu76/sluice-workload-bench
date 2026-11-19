@@ -4,7 +4,9 @@
 wall 609.4s）与对比（`tools/compare_fio.py`）均已执行；50 个 fio JSON 原件
 与 manifest 数字交叉核对一致（`results/fio/compare.json` `crosschecks`）。
 数据表在下方标记区由 compare_fio.py 生成；本文其余部分为测量员的解读与
-资格声明，全部结论可回指到 `results/fio/` 原件。
+资格声明，§1–§4 与数据表的全部数字可回指到 `results/fio/` 原件；§5
+Attribution 除外——其计数回执未归档（UNVERIFIED_EXPLORATORY_ATTRIBUTION，
+见 §5 标注）。
 
 - 生成链：`run_fio_matrix.py`（A/A 对 + F1/F2/F4/F3 × psync/io_uring/
   sluice-threadpool/sluice-uring × 2 repeats，串行，fio JSON 原件落
@@ -38,7 +40,7 @@ wall 609.4s）与对比（`tools/compare_fio.py`）均已执行；50 个 fio JSO
 | 文件系统 | `/` 与 `/home` 均为 /dev/sda3 btrfs（compress=zstd:1, ssd, discard=async, space_cache=v2）；/tmp tmpfs(32G)。按任务书选择 build/scratch 位于 btrfs | 记录：真实 FS 路径，非 tmpfs |
 | 存储底座 | sda = GS-480 447G SATA SSD（rotational=0, zoned=none）。**实测持续写在 SLC 缓存耗尽后跌至 ~10–20MB/s**（诊断实验：同一文件三连写 1004MiB/s→13MiB/s→3.7MiB/s） | 环境限制：F3 写混场景受此支配（见 §3） |
 | 内存 | 62G（buff/cache ~30G），1G 测试文件页缓存常驻 | 已利用（热缓存基线） |
-| PMU | perf 7.3.3 可用，perf_event_paranoid=2 → **仅用户态计数**，内核态计数为环境限制；strace/taskset/chattr 可用 | Attribution 以用户态 + syscall 混合完成（§5） |
+| PMU | perf 7.3.3 可用，perf_event_paranoid=2 → **仅用户态计数**，内核态计数为环境限制；strace/taskset/chattr 可用 | Attribution 以用户态 + syscall 混合完成（§5）；§5 计数回执未归档，UNVERIFIED_EXPLORATORY_ATTRIBUTION |
 | sudo | `sudo -n true` 失败（需密码）→ governor 钉住、turbostat、bpftrace 不可用 | 环境限制，未假装控制 |
 | 工具链 | fio fio-3.40（与引擎 ABI 一致）；四产物齐备；引擎 load 行 revision=5d94f23… = SLUICE_REVISION；native io_uring 与 sluice-uring 探针均可用（本次无 UNAVAILABLE 行） | 资格成立 |
 
@@ -47,13 +49,19 @@ wall 609.4s）与对比（`tools/compare_fio.py`）均已执行；50 个 fio JSO
 数字见下方数据表 A/A 节（F2 形态、10s 窗口、同配置重复两次）。
 
 - **psync（native）**：788149 vs 775290 IOPS，Δ1.65%；p99 1.304/1.320µs，
-  Δ1.22%；CPU 秒 Δ0.035%。机器 + fio 原生链路的噪声底 ≈ **1.6%**。
+  Δ1.22%；CPU 秒 Δ0.035%。该值为 psync 的 OBSERVED_TWO_REPEAT_SPREAD
+  （两次重复的极差，非噪声底、非最小可检测效应、非 95% 区间）。
 - **sluice-threadpool**：220629 vs 202952 IOPS，Δ8.35%；p99 Δ6.76%；
-  CPU 秒 Δ0.81%。含引擎的整链路重复性 ≈ **8%**，方差主要来自引擎侧
-  （futex 挥手的调度抖动），机器噪声底不能解释。
-- 结论：横向对照中，native 引擎间 <5% 的差异、sluice 引擎间 <10% 的
-  差异都在噪声范围内，不构成结论；两 repeats 均值 + 逐 rep 值
-  （compare.json `matrix.*.iops_total_per_rep`）共同作为判读依据。
+  CPU 秒 Δ0.81%。该值为 sluice-TP 的 OBSERVED_TWO_REPEAT_SPREAD（两次
+  重复极差）；方差方向与引擎侧（futex 挥手的调度抖动）相容，但两次
+  样本不足以将其确立为整链路噪声底。
+- 结论（OBSERVED_TWO_REPEAT_SPREAD，INSUFFICIENT_FOR_GENERAL_NOISE_THRESHOLD）：
+  以上仅是 psync 与 sluice-TP 各两次重复的观测极差（1.6%/8.35%），不是
+  native io_uring 或 sluice-uring 的噪声底（二者无 A/A 对；F1 io_uring
+  rep spread 11.0% 即超出 8%），不是最小可检测效应，不是 95% 置信区间，
+  不构成普适 <5%/<10% 判读规则。判读以两 repeats 均值 + 逐 rep 值
+  （compare.json `matrix.*.iops_total_per_rep`）逐 case 呈现，引擎间差距
+  远大于观测极差的 case 才作解读。
 
 ## 3. F1–F4 × 四引擎对照
 
@@ -62,12 +70,13 @@ psync 为同步引擎：D16/D4 配置被 fio 钳到 D1（stdout note 自动捕�
 `mean depth` 列显示 `1 (capped)`）——这是 fio 引擎语义，如实记录而非
 缺陷；其 achieved depth 即 1。
 
-**读为主的 case（F1/F2/F4）——本次基线的有效部分：**
+**读为主的 case（F1/F2/F4）——EXPLORATORY_F1_F2_F4（探索性对照基线，有效部分）：**
 
 - F1（4k randread D1，热缓存）：psync 785.8k > io_uring 616.0k >
   sluice-uring 422.5k > sluice-TP 39.2k IOPS。sluice-uring 达到 native
-  io_uring 的 0.69×；sluice-TP 在 D1 被 futex 挥手支配（p99 27.8µs，
-  ctx/kiop 2445，是其他引擎的 10³ 倍量级）。
+  io_uring 的 0.69×；sluice-TP 在 D1 被 futex 挥手支配（机制表述；p99 27.8µs
+  与 ctx/kiop 2445 为已归档原件，握手成本的定量依据见 §5——
+  UNVERIFIED_EXPLORATORY_ATTRIBUTION）。
 - F2（4k randread D16）：psync(D1-capped) 789.5k ≈ 其 D1 水平；
   io_uring 618.9k（achieved depth 16）；sluice-uring 368.0k（0.59×
   native，p99 53.8µs）；sluice-TP 211.6k（p99 149.5µs；CPU 41.4s，
@@ -78,7 +87,7 @@ psync 为同步引擎：D16/D4 配置被 fio 钳到 D1（stdout note 自动捕�
 - 引擎间关系稳定：F1/F2/F4 的两 rep spread 除 F1/io_uring（11.0%）与
   F2/sluice-uring（6.7%）外均 ≤3.7%，远小于引擎间差距。
 
-**F3（4k randrw 70/30 D16）——环境受限，不支持跨引擎排名：**
+**F3（4k randrw 70/30 D16）——F3_ENVIRONMENT_CONFOUNDED（SATA SSD SLC 缓存耗尽环境混杂），不支持跨引擎排名：**
 
 - 正式跑的 F3 落在 SSD SLC 耗尽区：F3_prep 本身耗时 40.6s（1G 写入仅
   ~25MB/s，此前 5×1G prep 已累积 ~4.5G 写）；psync 4.6k 总 IOPS
@@ -130,34 +139,48 @@ seed 81；blocking 后端仅 D1，D>1 的格子按构造跳过）。
 
 ## 5. Attribution（driver / adapter / Sluice / kernel / worker）
 
+**UNVERIFIED_EXPLORATORY_ATTRIBUTION**——本节数字来自前一测量会话的未归档
+统计回执；本轮无独立原始计数复核；不作为产品性能裁决依据；Adapter+Sluice
+为组合开销，不能独立推断 Adapter 净开销；strace 未见额外 syscall 不代表
+不存在用户态开销。
+
 采样方法（测量员会话内串行，不进正式门）：`perf stat -x, -e task-clock,
 instructions,cycles,context-switches,cpu-migrations`（用户态，
 paranoid=2 限制）与 `strace -c -f`，各引擎 3s D16 randread 4k 热缓存
 短跑（64M +C 文件，taskset 0-9）。原始输出在测量员会话记录；
 正式矩阵侧旁证 = manifest 的 rusage（CPU 秒、ctx 切换）与 fio
 usr/sys CPU。目的仅是发现适配层的严重阻塞、重复遍历或拷贝。
+（注：instructions/IO 的归一化分母——计数窗口内的完成 IO 数——亦未随回执
+归档。）
 
 - **无隐藏 POSIX fallback**：sluice-uring 的 strace 仅 io_uring_enter
   （61.4k 次 ≈ 1 次/IO，无 pread64）；sluice-TP 仅 pread64（74.0k ≈
   1 次/IO）。各引擎 syscall 数 ≈1/IO，**未见重复遍历或拷贝的 syscall
   特征**。
-- **每 IO 用户态指令**：native psync ~2.4k、native io_uring ~2.9k；
-  sluice-uring ~7.9k、sluice-TP ~8.9k → **adapter + Sluice 层增加
-  ~5–6k 用户态指令/IO（约 3× native driver 成本）**。sluice-uring 在
-  CPU 受限的热缓存读上达到 native io_uring 的 0.59–0.69×，与该指令
-  差距相称——差距是真实的机器工作，不是阻塞或等待。
-- **TP 的成本在挥手不在指令**：sluice-TP 每指份数与 native 相当，但
-  task-clock(u) 10.3s vs 3.2s（3.2×）、IPC 0.89 vs ~1.9；strace 每 IO
-  ~3.4 次 futex（251k futex / 74k pread，8.2s 累计耗在 futex）。
-  正式矩阵旁证：F2 处 TP CPU 41.4s vs 其他引擎 12.2s；ctx/kiop
-  1308–5999 vs native/uring 的 0.17–1.2（10³ 倍量级）。D1 时该挥手
-  完全串行化（F1 仅 39.2k IOPS）；D4 大块时流水化后反超（F4 最高）。
+- **每 IO 用户态指令（UNVERIFIED_EXPLORATORY_ATTRIBUTION，数字保留原读数）**：
+  native psync ~2.4k、native io_uring ~2.9k；sluice-uring ~7.9k、
+  sluice-TP ~8.9k → **adapter + Sluice 组合层约多 ~5–6k 用户态指令/IO
+  （约 3× native driver 成本；组合开销，不能独立推断 Adapter 净开销）**。
+  sluice-uring 在 CPU 受限的热缓存读上达到 native io_uring 的
+  0.59–0.69×（此吞吐比来自已归档矩阵原件），与该未复核指令差距方向
+  相容——解释为'真实机器工作而非阻塞'是假设，需归档计数复核后方可确立。
+- **TP 的成本在挥手不在指令（短跑计数为 UNVERIFIED_EXPLORATORY_ATTRIBUTION；
+  正式矩阵旁证来自已归档 manifest rusage）**：sluice-TP 每指份数与 native
+  相当，但 task-clock(u) 10.3s vs 3.2s（3.2×）、IPC 0.89 vs ~1.9；strace
+  每 IO ~3.4 次 futex（251k futex / 74k pread，8.2s 累计耗在 futex）
+  （未归档回执）。正式矩阵旁证（已归档，manifest rusage）：F2 处 TP CPU
+  41.4s vs 其他引擎 12.2s；ctx/kiop 1308–5999 vs native/uring 的
+  0.17–1.2（10³ 倍量级）。D1 时该挥手完全串行化（F1 仅 39.2k IOPS）；
+  D4 大块时流水化后反超（F4 最高）。
 - **kernel 侧计数不可得**（perf_event_paranoid=2），内核/适配边界只能
   用 syscall 计数 + 用户态指令 + rusage 旁证，无法做内核态周期分解——
   记录为环境限制。
-- 结论：适配层**未发现**严重阻塞、重复遍历或缓冲拷贝；主要开销是
-  (a) 适配+Sluice 每多 ~5–6k 用户态指令/IO，(b) TP 后端的 futex 挥手
-  （Sluice 产品侧属性，非 fio adapter 引入）。
+- 结论（探索性，UNVERIFIED_EXPLORATORY_ATTRIBUTION）：在未归档回执所示
+  采样内未观察到严重阻塞、重复遍历或缓冲拷贝特征（strace 未见额外
+  syscall 不代表不存在用户态开销）；主要开销 (a) 适配+Sluice 组合每多
+  ~5–6k 用户态指令/IO（未复核），(b) TP 后端的 futex 挥手（Sluice
+  产品侧属性，非 fio adapter 引入；此归因方向有已归档 rusage/ctx 旁证）。
+  不作为产品性能裁决依据。
 
 ## 6. fio JSON 原件索引
 
@@ -180,14 +203,14 @@ usr/sys CPU。目的仅是发现适配层的严重阻塞、重复遍历或拷贝
 
 模式：`formal`；fio `fio-3.40`；Sluice revision `5d94f233967c3aef993eb19ba9e3252c532b0951`；randseed `81`；numjobs=1；direct=0；runtime=10s(+ramp 2s)；cpu_set=0-9。
 
-#### A/A（同配置重复，F2 形态）
+#### A/A（同配置重复两次，F2 形态；仅 psync 与 sluice-threadpool——OBSERVED_TWO_REPEAT_SPREAD，INSUFFICIENT_FOR_GENERAL_NOISE_THRESHOLD：非 io_uring/sluice-uring 噪声底，非最小可检测效应，非 95% 区间，非普适 5%/10% 规则）
 
 | engine | rep1 IOPS | rep2 IOPS | ΔIOPS% | rep1 p99µs | rep2 p99µs | Δp99% | Δmean-depth% |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | psync | 788149.2 | 775289.9 | 1.645 | 1.304 | 1.32 | 1.22 | 0 |
 | sluice-threadpool | 220629.137 | 202952.305 | 8.346 | 146.432 | 156.672 | 6.757 | 0 |
 
-#### F1–F4 × 四引擎（两 repeats 均值；读方向延迟；IOPS 逐 rep 见 compare.json）
+#### F1–F4 × 四引擎（EXPLORATORY_F1_F2_F4 探索性对照；F3_ENVIRONMENT_CONFOUNDED：F3 受 SATA SSD SLC 耗尽支配，不支持跨引擎排名。两 repeats 均值；读方向延迟；IOPS 逐 rep 见 compare.json）
 
 | case | engine | status | IOPS r/w/total | rep spread% | BW MiB/s r/w | p50µs | p95µs | p99µs | mean depth | CPU s | ctx/kiop |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|

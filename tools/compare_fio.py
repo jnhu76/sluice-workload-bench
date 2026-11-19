@@ -8,6 +8,10 @@ Contract (executed verbatim by the workflow, after run_fio_matrix.py):
 Outputs:
   - <results-dir>/compare.json : A/A diff, four-engine table, envelope
     arm with comparability annotations, cross-check verdicts.
+    Note: `aa` covers only the --aa-engines default pair (psync,
+    sluice-threadpool) with 2 repeats and emits OBSERVED_TWO_REPEAT_SPREAD
+    (a two-repeat observed spread), not a general noise threshold; no A/A
+    pair exists for native io_uring or sluice-uring.
   - the markdown data tables injected between the PERF-DATA markers in
     the --doc skeleton (prose is owned by the later report phase).
 
@@ -73,6 +77,12 @@ def parse_args() -> argparse.Namespace:
                     help="taskset pinning for envelope bench runs; "
                          "empty disables")
     ap.add_argument("--skip-envelope", action="store_true")
+    ap.add_argument("--envelope-json", default=None,
+                    help="reuse the envelope block of a previous "
+                         "compare.json verbatim instead of re-running "
+                         "the bench binaries (receipt-preserving "
+                         "regeneration; live envelope numbers are "
+                         "physical measurements and never reproduce)")
     ap.add_argument("--rehearsal", action="store_true",
                     help="shrink envelope request counts for self-test")
     args = ap.parse_args()
@@ -387,7 +397,11 @@ def markdown(manifest: dict, table: dict, envelope: dict, notes: dict) -> str:
                     manifest["config"].get("ramp_time_s"),
                     manifest["config"].get("cpu_set")))
     lines.append("")
-    lines.append("#### A/A（同配置重复，F2 形态）")
+    lines.append("#### A/A（同配置重复两次，F2 形态；仅 psync 与 "
+                 "sluice-threadpool——OBSERVED_TWO_REPEAT_SPREAD，"
+                 "INSUFFICIENT_FOR_GENERAL_NOISE_THRESHOLD：非 "
+                 "io_uring/sluice-uring 噪声底，非最小可检测效应，"
+                 "非 95% 区间，非普适 5%/10% 规则）")
     lines.append("")
     lines.append("| engine | rep1 IOPS | rep2 IOPS | ΔIOPS% | rep1 p99µs "
                  "| rep2 p99µs | Δp99% | Δmean-depth% |")
@@ -408,7 +422,9 @@ def markdown(manifest: dict, table: dict, envelope: dict, notes: dict) -> str:
                         fmt(f["p99_us"]["delta_pct"]),
                         fmt(md["delta_pct"]) if md else "-"))
     lines.append("")
-    lines.append("#### F1–F4 × 四引擎（两 repeats 均值；读方向延迟；"
+    lines.append("#### F1–F4 × 四引擎（EXPLORATORY_F1_F2_F4 探索性对照；"
+                 "F3_ENVIRONMENT_CONFOUNDED：F3 受 SATA SSD SLC 耗尽支配，"
+                 "不支持跨引擎排名。两 repeats 均值；读方向延迟；"
                  "IOPS 逐 rep 见 compare.json）")
     lines.append("")
     lines.append("| case | engine | status | IOPS r/w/total | rep spread% "
@@ -496,7 +512,17 @@ def main() -> int:
     manifest, crosschecks, problems = load_and_verify(results)
     table = aggregate(manifest)
 
-    if args.skip_envelope:
+    if args.envelope_json:
+        # Receipt-preserving regeneration: live envelope numbers are
+        # physical measurements and would silently replace the archived
+        # ones; reuse the whole block (runs, seed, working set) verbatim.
+        archived = json.loads(
+            pathlib.Path(args.envelope_json).read_text())
+        envelope = archived.get("envelope")
+        if not envelope or not envelope.get("runs"):
+            raise SystemExit("--envelope-json %s carries no envelope runs"
+                             % args.envelope_json)
+    elif args.skip_envelope:
         envelope = {"runs": [], "skipped": True, "seed": SEED,
                     "working_set_mib": None}
     else:
