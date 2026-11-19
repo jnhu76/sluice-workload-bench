@@ -51,7 +51,19 @@ int sluice_close_file(struct thread_data* td, struct fio_file* f) {
     if (state != nullptr) {
         for (const auto& slot : state->slots) {
             if (slot.u != nullptr && slot.u->file == f) {
-                log_err("fio-sluice: closing fd %d with an in-flight request\n", f->fd);
+                // fio gates the real close on f->references == 0
+                // (filesetup.c:1898/1912-1913) and every io_u holds a
+                // reference until it is reaped (io_u.c:1488/855-856), so
+                // a live slot at close_file means an engine bookkeeping
+                // bug, not a legal fio sequence. Closing anyway could
+                // misdirect still-borrowed I/O to a reused fd number;
+                // returning an error without closing violates put_file's
+                // f->fd == -1 post-condition (filesetup.c:1921). Fail
+                // closed like every other invariant breach.
+                log_err("fio-sluice: close_file invariant violated: fd %d still has"
+                        " in-flight request(s); failing closed\n",
+                        f->fd);
+                std::terminate();
             }
         }
         state->files.erase(f->fd);
