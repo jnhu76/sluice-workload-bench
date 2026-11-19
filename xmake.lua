@@ -228,7 +228,13 @@ local function bench_target(name, profile)
         end)
 end
 
-local function engine_target(name, profile)
+-- sym=true builds the DIAGNOSTIC twin of an engine: identical sources, SDK
+-- and optimization flags, but symbols kept (no strip) plus -g so perf record
+-- sampled attribution can resolve adapter and inlined Sluice functions. The
+-- campaign keeps the stripped release twin as the measurement baseline and
+-- records both SHAs plus a .text section hash comparison in the session's
+-- binary-manifest (COST-ATTRIBUTION-METHOD §5, G4 attribution limits).
+local function engine_target(name, profile, sym)
     local sdk = path.join(sdk_prefix(profile, true), "sdk")
     target(name)
         set_kind("shared")
@@ -236,6 +242,10 @@ local function engine_target(name, profile)
         add_files("adapters/fio/src/*.cpp")
         add_includedirs(fio_dir)
         add_cxxflags("-isystem " .. path.join(sdk, "include"), { force = true })
+        if sym then
+            set_strip("none")
+            add_cxxflags("-g", { force = true })
+        end
         link_setup(sdk, profile)
         on_load(function(target)
             if io ~= nil and io.readfile ~= nil then
@@ -258,6 +268,8 @@ bench_target("sluice-workload-bench", "noring")
 bench_target("sluice-workload-bench-ring", "ring")
 engine_target("fio-sluice-noring", "noring")
 engine_target("fio-sluice-ring", "ring")
+engine_target("fio-sluice-noring-sym", "noring", true)
+engine_target("fio-sluice-ring-sym", "ring", true)
 
 target("fio-sluice-errno-map-test")
     set_kind("binary")
