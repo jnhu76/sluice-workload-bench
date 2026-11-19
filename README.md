@@ -15,7 +15,7 @@ is no Makefile). Builds fetch Sluice by revision and stage the SDK under a
 separate prefix per profile. Set SLUICE_SOURCE to the path of an existing local
 Sluice Git checkout to fetch the pinned commit locally.
 
-Four build targets plus a unit test target (all land in
+Four build targets plus two unit test targets (all land in
 `build/linux/x86_64/release/`):
 
 | Target | Artifact | Notes |
@@ -25,6 +25,7 @@ Four build targets plus a unit test target (all land in
 | `fio-sluice-noring` | `fio-sluice-noring.so` | fio external engine, PIC noring SDK, threadpool backend |
 | `fio-sluice-ring` | `fio-sluice-ring.so` | fio external engine, PIC ring SDK, threadpool + io_uring backends |
 | `fio-sluice-errno-map-test` | unit test binary | IoError-to-errno mapping exhaustiveness |
+| `fio-sluice-lifecycle-test` | unit test binary | close/init lifecycle contract tests on the real engine TUs (test-only `SLUICE_FIO_INIT_SEAM`) |
 
 ```sh
 xmake f -m release -y
