@@ -16,7 +16,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 LABELS = {
     "PROCESS_LIFECYCLE_INSTRUCTIONS_per_op": "instr/op (u)",
     "PROCESS_LIFECYCLE_CYCLES_per_op": "cycles/op (u)",
-    "PROCESS_LIFECYCLE_CPU_TIME_us_per_op": "cpu-us/op (u)",
+    "PROCESS_LIFECYCLE_CPU_TIME_us_per_op":
+        "cpu-us/op (task total)",
 }
 
 
@@ -46,7 +47,7 @@ def render_main(norm: dict) -> str:
     if not rows:
         return "(no pmu rows)\n"
     out = ["| cell | engine | reps | instr/op (u) | cycles/op (u) | "
-           "cpu-us/op (u) | denominator |\n",
+           "cpu-us/op (task total) | denominator |\n",
            "|---|---|---:|---:|---:|---:|---:|\n"]
     for r in rows:
         out.append("| %s | %s | %d | %s | %s | %s | %s |\n" % (

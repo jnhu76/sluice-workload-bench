@@ -92,3 +92,18 @@ ramp=2s 与 Phase 1 基线口径一致（clean 不做 per-op PMU 归一）。
 | 函数热点占比 | perf record `cycles:u` 采样 | 采样窗口 | 采样样本数（`SAMPLED`） |
 | IOPS/lat p50/95/99 | fio JSON（正式窗口） | ramp 后窗口 | fio 自身口径 |
 | clat 与 lat | 分开取，clat 标注为完成延迟，非端到端 lat | fio 口径 | — |
+
+## 变更记录（透明性声明；审计要求）
+
+- **冻结件**：本会话预注册的冻结快照是 `PROTOCOL.md`（session-001，测量
+  开始前生成）中内嵌的本文件副本；其公式记法为 `|B−C|/B`、字段名
+  `startup_share_bound`。
+- **测量后修订（本文件，16:05）**：① Option C 交叉核验由"仅 io_uring"扩展
+  为**逐引擎**（`per_engine`）；② 差值公式字段统一为 `delta_pct_of_C`
+  （以 C 为分母）并把 `startup_share_bound` 细化为
+  `startup_share_bound_pct`（数值）；③ 明确 sluice/TP 的跨模式差按
+  mode/timing 效应解释。**预注册阈值（10%）未变，任何门禁判定未因结果
+  回看而调整**；该修订由独立审计发现并在本记录中显式声明。
+- 首次正式测量前的冒烟会话发现 fio `io_bytes` 仅覆盖 ramp 后窗口，故
+  插桩模式固定 `ramp_time=0` —— 此次修正发生在正式测量开始前（14:29
+  冻结，14:31 首 run），不属于事后调整。

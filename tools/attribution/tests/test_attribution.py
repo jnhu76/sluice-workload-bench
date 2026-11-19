@@ -18,7 +18,8 @@ import unittest
 TOOLS = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(TOOLS))
 
-from attribution import capability, parse_perf, parse_trace, report  # noqa: E402
+from attribution import (capability, parse_bpftrace, parse_perf,  # noqa: E402
+                        parse_trace, report)
 
 
 def write(path: pathlib.Path, text: str) -> pathlib.Path:
@@ -343,6 +344,54 @@ class TestAnalyze(unittest.TestCase):
         self.assertEqual(traced["lifecycle_ios"], 300)
         self.assertEqual(traced["syscalls"]["io_uring_enter"]
                          ["calls_per_op"], 1.0)
+
+
+class TestRootSession(unittest.TestCase):
+    def test_bpftrace_maps_and_summary(self):
+        raw = ("@enter[fio]: 1000\n"
+               "@submit[fio]: 1000\n"
+               "@punt[fio]: 998\n"
+               "@cqe[fio]: 400\n@cqe[iou-wrk-7]: 600\n"
+               "@futex[fio]: 12\n"
+               "@dwell[fio]: 5000000000\n"
+               "@dwell[iou-wrk-7]: 3000000000\n")
+        maps = parse_bpftrace.parse_maps(raw)
+        self.assertEqual(maps["enter"][("fio",)], 1000)
+        self.assertEqual(maps["dwell"][("iou-wrk-7",)], 3000000000)
+        summary = parse_bpftrace.summarize(maps, 1000)
+        self.assertEqual(summary["per_op"]["enters"], 1.0)
+        self.assertEqual(summary["per_op"]["punts"], 0.998)
+        self.assertEqual(summary["per_op"]["cqe_events"], 1.0)
+        self.assertEqual(summary["worker_dwell_us_per_op"], 3000.0)
+        self.assertEqual(summary["dwell_ms"]["fio"], 5000.0)
+
+    def test_bpftrace_lost_events(self):
+        self.assertEqual(
+            parse_bpftrace.detect_lost("Lost 927693 events\n"), 927693)
+        self.assertIsNone(parse_bpftrace.detect_lost("no warning"))
+
+    def test_root_pmu_kernel_scope(self):
+        run = {"run_id": "A1__io_uring__pmu-root-g2__rep1",
+               "metrics": {"lifecycle_ios": 1000,
+                           "directions": {"read": {"iops": 100000.0}}},
+               "perf": parse_perf.parse_perf_stat_csv(
+                   "500000,,cycles:u,1,100.00,,\n"
+                   "2500000,,cycles:k,1,100.00,,\n")}
+        row = report._root_pmu_row(run)
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["values"]["cycles:u"]["scope"], "user")
+        self.assertEqual(row["values"]["cycles:k"]["scope"], "kernel")
+        self.assertEqual(row["values"]["cycles:k"]["per_op"], 2500.0)
+
+    def test_root_pmu_not_counted_stays_unavailable(self):
+        run = {"run_id": "A1__x__pmu-root-g3__rep1",
+               "metrics": {"lifecycle_ios": 1000,
+                           "directions": {"read": {"iops": 1.0}}},
+               "perf": parse_perf.parse_perf_stat_csv(
+                   "<not counted>,,LLC-loads,0,0.00,,\n")}
+        row = report._root_pmu_row(run)
+        self.assertEqual(row["values"]["LLC-loads"]["class"], "UNAVAILABLE")
+        self.assertEqual(row["status"], "REFUSED")
 
 
 class TestWindowContract(unittest.TestCase):

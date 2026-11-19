@@ -21,11 +21,13 @@ import json
 import pathlib
 import re
 
-from . import parse_perf, parse_trace
+from . import parse_bpftrace, parse_perf, parse_trace
 
 RANKED_EXCLUDED_PREFIXES = ("F3",)  # environment-confounded, never ranked
-MODES = ("clean", "pmu", "pmu-aux1", "pmu-aux2", "record",
-         "trace-bare", "trace-straced", "trace-shape")
+MODES = ("clean", "clean0", "pmu", "pmu-aux1", "pmu-aux2",
+         "pmu-root-g1", "pmu-root-g2", "pmu-root-g3",
+         "record", "record-root", "record-root-k",
+         "trace-bare", "trace-straced", "trace-shape", "trace-bpf")
 
 
 def parse_fio_json(raw: str) -> dict | None:
@@ -117,8 +119,11 @@ def load_run(run_dir: pathlib.Path) -> dict | None:
     if not meta_p.exists():
         return None
     meta = json.loads(meta_p.read_text())
+    job_p = run_dir / "fio-job.fio"
+    job_text = job_p.read_text() if job_p.exists() else ""
     run = {"run_id": run_dir.name, "dir": str(run_dir), "meta": meta,
-           "metrics": None, "perf": None, "trace": None}
+           "job_text": job_text, "metrics": None, "perf": None,
+           "trace": None}
     if fio_p.exists():
         run["metrics"] = fio_metrics(fio_p.read_text())
     perf_p = run_dir / "perf-stat.raw.txt"
@@ -138,6 +143,14 @@ def load_run(run_dir: pathlib.Path) -> dict | None:
     if report_p.exists():
         run["perf_report"] = parse_perf.parse_perf_report(
             report_p.read_text())
+    bpf_p = run_dir / "bpftrace.stdout.txt"
+    if bpf_p.exists():
+        err_p = run_dir / "bpftrace.stderr.txt"
+        stderr = err_p.read_text() if err_p.exists() else ""
+        run["bpftrace"] = {
+            "maps": parse_bpftrace.parse_maps(bpf_p.read_text()),
+            "lost_events": parse_bpftrace.detect_lost(stderr),
+        }
     return run
 
 
@@ -295,6 +308,30 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
             if tmode in group["modes"]:
                 entry[tmode] = [
                     _trace_row(r) for r in group["modes"][tmode]]
+        # Root PMU: every counted event, scope derived from the :u/:k
+        # suffix; kernel rows are now REAL counts (capability FULL).
+        for mode in ("pmu-root-g1", "pmu-root-g2", "pmu-root-g3"):
+            if mode in group["modes"]:
+                rows = []
+                for run in group["modes"][mode]:
+                    row = _root_pmu_row(run)
+                    row["run_id"] = run["run_id"]
+                    rows.append(row)
+                entry.setdefault("pmu-root", []).extend(rows)
+        for mode in ("record-root", "record-root-k"):
+            if mode in group["modes"]:
+                key = ("record-root" if mode == "record-root"
+                       else "record-root-kernel")
+                entry[key] = []
+                for r in group["modes"][mode]:
+                    entry[key].append({
+                        "run_id": r["run_id"],
+                        "class": ("SAMPLED" if mode == "record-root"
+                                  else "SAMPLED_KERNEL"),
+                        "perf_report": r.get("perf_report")})
+        if "trace-bpf" in group["modes"]:
+            entry["trace-bpf"] = [_bpf_row(r) for r in
+                                  group["modes"]["trace-bpf"]]
         normalized["%s/%s" % (cell, engine)] = entry
 
     window = _window_contract(cells)
@@ -373,13 +410,13 @@ def _aggregate_clean(clean_runs: list, window_matched: bool) -> dict:
     whole process while fio's io_bytes covers the post-ramp window, so for
     ramp=2 clean runs a per-op rusage division would be inflated by the
     ramp fraction (~20% here). Those rows stay raw values, no per-op."""
-    out = {"runs": [], "iops_values": [],
-           "window_matched": window_matched}
+    out = {"runs": [], "iops_values": [], "window_matched": True}
     if not window_matched:
+        out["window_matched"] = False
         out["per_op_note"] = (
             "CLEAN_RAMP2_LIFECYCLE_MISMATCH: rusage window includes ramp; "
-            "io_bytes excludes it -- no rusage per-op computed here, use "
-            "clean0/pmu rows")
+            "io_bytes excludes it -- rusage per-op is computed only for "
+            "runs whose own job text says ramp_time=0 (e.g. C2 clean)")
     for run in clean_runs:
         m = run["metrics"] or {}
         direction = (m.get("directions") or {}).get("read") or {}
@@ -400,12 +437,14 @@ def _aggregate_clean(clean_runs: list, window_matched: bool) -> dict:
         spread = (max(vals) - min(vals)) / (sum(vals) / len(vals)) * 100
         out["observed_spread_pct"] = round(spread, 3)
         out["spread_class"] = "HIGH_SPREAD" if spread > 15 else "ok"
-    if not window_matched:
-        return out
     # Scheduling counters: rusage is exact and unaffected by the perf
     # exclude_kernel restriction (scope = fio process tree incl. workers).
+    # Per-run window check (not the invocation label): a clean run is only
+    # window-matched when its OWN job text carries ramp_time=0.
     per_op = []
     for run in clean_runs:
+        if "ramp_time=0" not in (run.get("job_text") or ""):
+            continue
         m = run["metrics"] or {}
         ios = m.get("lifecycle_ios")
         ru = run["meta"].get("rusage") or {}
@@ -424,6 +463,11 @@ def _aggregate_clean(clean_runs: list, window_matched: bool) -> dict:
             })
     if per_op:
         out["rusage_per_op"] = per_op
+    out["window_matched"] = bool(per_op) and len(per_op) == len(clean_runs)
+    if per_op and not out["window_matched"]:
+        out["per_op_note"] = (out.get("per_op_note", "") +
+                              " (partially window-matched: only ramp_time=0 "
+                              "runs carry rusage per-op)").strip()
     return out
 
 
@@ -459,6 +503,57 @@ def _attach_aux(row: dict, run: dict, mode: str) -> None:
         else:
             aux[event] = {"per_op": None, "class": "UNAVAILABLE"}
     row["aux_events"] = aux
+
+
+def _root_pmu_row(run: dict) -> dict:
+    metrics = run["metrics"] or {}
+    ios = metrics.get("lifecycle_ios")
+    direction = ((metrics.get("directions") or {}).get("read") or {})
+    row = {"status": "REFUSED", "window": "process_lifecycle",
+           "denominator": ios, "iops": direction.get("iops"),
+           "values": {}}
+    if not ios:
+        row["reason"] = "no lifecycle denominator"
+        return row
+    for event, entry in (run["perf"] or {}).items():
+        scope = ("kernel" if event.endswith(":k")
+                 else "user" if event.endswith(":u") else "task_total")
+        if entry["kind"] == "counted":
+            value = entry["value"] / ios
+            if event.startswith("task-clock"):
+                row["values"][event] = {
+                    "per_op": round(value * 1000.0, 3), "unit": "us",
+                    "class": "counted", "scope": "task_total"}
+            else:
+                row["values"][event] = {
+                    "per_op": round(value, 4), "class": "counted",
+                    "scope": scope}
+        elif entry["kind"] == "scaled":
+            row["values"][event] = {"per_op": None, "class": "SCALED",
+                                    "time_running_pct":
+                                    entry["time_running_pct"]}
+        else:
+            row["values"][event] = {"per_op": None,
+                                    "class": "UNAVAILABLE"}
+    row["status"] = ("ok" if any(v.get("class") == "counted"
+                                 for v in row["values"].values())
+                     else "REFUSED")
+    return row
+
+
+def _bpf_row(run: dict) -> dict:
+    metrics = run["metrics"] or {}
+    ios = metrics.get("lifecycle_ios")
+    summary = {}
+    lost = None
+    if run.get("bpftrace"):
+        summary = parse_bpftrace.summarize(run["bpftrace"]["maps"], ios)
+        lost = run["bpftrace"]["lost_events"]
+    direction = ((metrics.get("directions") or {}).get("read") or {})
+    return {"run_id": run["run_id"], "label": "EBPF_COUNTED",
+            "lifecycle_ios": ios, "iops": direction.get("iops"),
+            "summary": summary, "lost_events": lost,
+            "join": "NOT_ATTEMPTED (aggregate counts only)"}
 
 
 def _trace_row(run: dict) -> dict:

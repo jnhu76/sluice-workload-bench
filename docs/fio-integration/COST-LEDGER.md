@@ -13,9 +13,9 @@
   探测为 permission denied，非 0）。本表**没有任何内核态 CPU 数字**。
 - per-op 口径 = `PROCESS_LIFECYCLE_*`（ramp=0，窗口=进程生命周期，分母=
   io_bytes/bs）。窗口契约（逐引擎）：native io_uring 的 A2（10s time_based）
-  vs C2（20G 定长、5.24M ios）指令/op 差 **1.05%**（2-rep 均值；<10% 预注册
+  vs C2（20G 定长、5.24M ios）指令/op 差 **1.01%**（2-rep 均值；<10% 预注册
   界）→ 启动/收尾污染 ≤~1% 已验证。**sluice-uring 与 TP 的跨模式差更大
-  （≈7–8% / ≈3%），且方向与启动摊销相反 → 按 mode/timing 效应处理；其
+  （7.41% / 4.14%），且方向与启动摊销相反 → 按 mode/timing 效应处理；其
   per-op 值携带该量级的跨模式不确定度**，不得引用 1.1% 作为 sluice 的
   精度（audit 修正；analysis/window-contract.json `per_engine`）。
 - 采样占比（perf record cycles:u）只进 SAMPLED 行，永不与 counted 相加、
@@ -117,7 +117,7 @@ full-chain 差额（§1 Δ）分解为：
 | fio driver 增量（async 语义 vs 内建） | 两臂同 fio 进程、同 job 机器；native record 的 top 符号全是 fio 自身（get_io_u 10%、__fio_gettime 10%、axmap_isset 5%…），driver 增量包含在 Δ 内，无法单独扣除 | NOT_SEPARATED_WITHOUT_COUNTERFACTUAL |
 | Adapter（queue/harvest/event） | SAMPLED：A2 `fio_sluice::harvest` 1.72%、A1 `sluice_queue` 2.80% | SAMPLED |
 | Sluice Core（RequestScope/RequestCore/Backend/ProgressSource） | SAMPLED：A1 mutex 31.1% + dispatch/queue/take/finalize/consume ~12.8%；A2 `RequestScope::take` **12.15%**（D1 时 2.44%） | SAMPLED + DEPTH_DIFFERENTIAL |
-| Kernel 侧差（io-wq/inline/FS） | 非 root 不可测；rusage sys 分量两臂接近（A1 1.08 vs 1.16µs/op） | UNAVAILABLE (cycles:k) |
+| Kernel 侧差（io-wq/inline/FS） | non-root 会话不可测；clean0 rusage sys 分量两臂接近（A1 0.90 vs 1.00µs/op） | UNAVAILABLE (cycles:k)；root 会话另见 ATTRIBUTION-RESULTS-R2 |
 | 重复工作（adapter scan × scope resolve） | 结构存在（源码）；D16 take/harvest 份额上升与 D16 指令差同向（但 D4<D1 非单调，见 H5） | DEPTH_DIFFERENTIAL |
 
 SAMPLED 份额明细（perf record，cycles:u；**A1 记录运行自身较 clean 慢
@@ -153,9 +153,9 @@ fio_ioring_prep/queued、io_completed…）。TP 对照：mutex/condvar
 
 | ID | 候选 | 判定（r2） | 证据 | 限制/阻断 |
 | --- | --- | --- | --- | --- |
-| H1 | ThreadPool queue/worker handoff | **LIKELY_BUT_UNPROVEN** | 机制三源：mutex/condvar 40–51%（SAMPLED，A2 近 clean）、ctx 0.9–2.5/op（rusage，窗口而异）、任务 CPU 14.5–42.8µs/op vs native ~1.7–1.9µs、A1 吞吐 0.06× native | futex 计数来自 <50% IOPS 的 strace 运行（预注册规则 → 只能 INCONCLUSIVE 级证据）；"futex 是主成本"未证明（次数≠阻塞）；kworker 侧不可测 |
+| H1 | ThreadPool queue/worker handoff | **LIKELY_BUT_UNPROVEN** | 机制三源：mutex/condvar 40–51%（SAMPLED，A2 近 clean）、ctx 0.9–2.0/op（clean0/pmu，窗口匹配）、任务 CPU 16–25µs/op（clean0 4k）vs native 1.6–1.7µs、A1 吞吐 0.077× native（clean0 基线） | futex 计数来自 <50% IOPS 的 strace 运行（预注册规则 → 只能 INCONCLUSIVE 级证据）；"futex 是主成本"未证明（次数≠阻塞）；kworker 侧不可测 |
 | H2 | io_uring submit/enter（#595 门禁） | **INCONCLUSIVE（结构 LIKELY 无差异）** | 两臂 ~1.0000 enter/op（strace shape，精确闭合）；native 每次 enter 带 GETEVENTS，sluice flags=0 + 用户态 peek；sys/op 两臂接近 | strace 触发 no-conclusion 规则；结构证据（fio io_uring 逐 io_u submit；Sluice submit_transport_locked 逐 submit flush）支持"形状等价"但非本 session 计量结论；#595 不受影响 |
-| H3 | Completion/Request observation | **LIKELY_BUT_UNPROVEN（Sluice Core 侧）** | A2 take 12.15%、handle_one_cqe 1.20%、finalize/consume/retire 合计 ~3%；publication 符号（complete_publication 等）≤0.7% | 仅 SAMPLED；Adapter 与 Core 观察成本无法独立切开；P/O 逐请求时序 `UNIDENTIFIABLE_WITH_CURRENT_INSTRUMENTATION` |
+| H3 | Completion/Request observation | **LIKELY_BUT_UNPROVEN（Sluice Core 侧）** | A2 take 12.15%、handle_one_cqe 1.20%、finalize 1.48% + consume 2.91% + retire 0.62%（合计 5.0%）；publication 符号（complete_publication 等）≤0.7% | 仅 SAMPLED；Adapter 与 Core 观察成本无法独立切开；P/O 逐请求时序 `UNIDENTIFIABLE_WITH_CURRENT_INSTRUMENTATION` |
 | H4 | ProgressSource notification/wait | **INCONCLUSIVE** | uring 臂 ProgressSource 相关用户态符号未进 top（<0.2% = 10K 样本的检测限，非缺失证明）；TP cond_wait 属 H1；eventfd/poll 在内核侧不可见 | 检测限功效不足；非 root 无 eventfd 观测；不重开 #621 W1 |
 | H5 | Capacity / repeated scan | **LIKELY_BUT_UNPROVEN（D16 抬升成立；扫描份额随深度单调）** | 指令差：D1 3,682 / D4 3,262 / D16 5,226（D4<D1，非单调）；**SAMPLED take 份额随深度单调：2.44% (D1) → 4.17% (D4) → 12.15% (D16)**；harvest 1.72%@D16。非单调解释（假设，未证）：D1 每 op 固定耦合成本更高（更多 getevents/wait），抵消 D4 的扫描增量 | D1/A1 采样基线受 18% 扰动；C2 模式差 7.4%（双 rep 稳定，机制未识别）；#579 门禁要求 adapter-only vs core 单因素 A/B；harvest（adapter）自身仅 1.7%，主体在 core take |
 | H6 | Buffer ownership/data movement | **INCONCLUSIVE** | 4k 与 64k（A3 record 补测）均无 memcpy/payload-copy 样本进 top；64k A3 的 Δ 小（+3,259 instr/op、+0.70µs/op）且以 sys 为主；A3 sluice top: mutex 27.4%、dispatch_one 4.0%、sluice_queue 3.8%、take 3.25% | 采样功效（10K samples、0.2% 限）不足以证明"无搬运"；真实 streaming consumer 属 #632，本轮不做 |

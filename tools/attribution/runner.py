@@ -94,7 +94,7 @@ class Session:
     def __init__(self, results_dir: pathlib.Path, scratch_dir: pathlib.Path,
                  cpu_set: str = "0-9", runtime_s: int = 10,
                  ramp_s: int = 2, file_size: str = "1G", fio: str = "fio",
-                 fio_diag: str | None = None):
+                 fio_diag: str | None = None, sudo_pw: str | None = None):
         self.root = results_dir.resolve()
         self.runs_dir = self.root / "runs"
         self.analysis_dir = self.root / "analysis"
@@ -105,6 +105,10 @@ class Session:
         self.ramp_s = ramp_s
         self.file_size = file_size
         self.fio = fio
+        # Owner-granted root session support: the password lives only in
+        # this process's memory and is piped to `sudo -S` stdin; it is
+        # never written to argv, meta.json, the evidence tree, or git.
+        self.sudo_pw = sudo_pw
         self.fio_diag = fio_diag or str(
             TOOLS_DIR.parent / "build" / "fio" / "upstream" / "fio")
         self.revision = (TOOLS_DIR.parent / "SLUICE_REVISION").read_text().strip()
@@ -400,8 +404,12 @@ class Session:
             timeout_s = self.runtime_s + self.ramp_s + 120
         before = resource.getrusage(resource.RUSAGE_CHILDREN)
         t0 = time.monotonic()
-        proc = subprocess.run(argv, capture_output=True, text=True,
-                              timeout=timeout_s, cwd=str(run_dir))
+        needs_sudo = bool(wrap) and "sudo" in wrap
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout_s,
+            cwd=str(run_dir),
+            input=(self.sudo_pw + "\n") if (needs_sudo and self.sudo_pw)
+            else None)
         wall = time.monotonic() - t0
         after = resource.getrusage(resource.RUSAGE_CHILDREN)
         stdout = proc.stdout
@@ -529,6 +537,173 @@ class Session:
                     callgraph.stdout)
                 (run_dir / "perf.data.sha256").write_text(
                     sha256_file(data_file) + "\n")
+
+    # -- root-session modes (Owner-granted sudo; no persistent config) ----
+
+    def _sudo(self, argv: list) -> list:
+        if not self.sudo_pw:
+            raise RuntimeError("root mode requested without a sudo password")
+        return ["sudo", "-S", "-p", ""] + argv
+
+    def mode_pmu_root(self, cells, engines, repeats: int = 2) -> None:
+        """Root PMU grids: user/kernel split plus scheduling/cache events.
+        Three orthogonal groups keep every event at 100% time-running."""
+        from .capability import MAIN_EVENTS  # noqa: F401 (non-root groups)
+        groups = (
+            ("pmu-root-g1", ("instructions:u", "instructions:k",
+                             "task-clock")),
+            ("pmu-root-g2", ("cycles:u", "cycles:k")),
+            ("pmu-root-g3", ("branches", "branch-misses",
+                             "context-switches", "cpu-migrations",
+                             "L1-dcache-loads", "LLC-loads")),
+        )
+        for cell in cells:
+            data = self.prep_file(cell, self.file_size)
+            for engine in engines:
+                for rep in range(1, repeats + 1):
+                    job = "\n".join(self.job_lines(
+                        engine, data, cell, ramp_override=0)) + "\n"
+                    for mode, events in groups:
+                        run_id = "%s__%s__%s__rep%d" % (cell, engine, mode,
+                                                       rep)
+                        wrap = self._sudo(
+                            ["perf", "stat", "-x,",
+                             "-o", str(self.runs_dir / run_id /
+                                       "perf-stat.raw.txt"),
+                             "-e", ",".join(events)])
+                        self.run_with_retry(
+                            run_id, job_text=job, wrap=wrap,
+                            expect_backend=engine_specs()[engine][1] or None)
+
+    def mode_record_root(self, cells, engines, kernel_cycles: bool = False) -> None:
+        """Root perf record with callchains: user dwarf for every engine,
+        optional kernel frame-pointer chains on the same run."""
+        for cell in cells:
+            data = self.prep_file(cell, self.file_size)
+            for engine in engines:
+                job = "\n".join(self.job_lines(engine, data, cell,
+                                               diag=True,
+                                               ramp_override=0)) + "\n"
+                run_id = "%s__%s__record-root__rep1" % (cell, engine)
+                run_dir = self.runs_dir / run_id
+                run_dir.mkdir(parents=True, exist_ok=True)
+                wrap = self._sudo(
+                    ["perf", "record", "-o", str(run_dir / "perf.data"),
+                     "-e", "cycles:u", "-F", "997",
+                     "--call-graph", "dwarf", "--"])
+                rec = self.run_with_retry(
+                    run_id, job_text=job, wrap=wrap, diag=True,
+                    expect_backend=engine_specs(diag=True)[engine][1] or None,
+                    extra={"diag_binary": True})
+                if rec["status"] == "ok":
+                    self._perf_reports(run_dir, "perf-report",
+                                       callgraph=True)
+                if kernel_cycles and engine in ("io_uring", "sluice-uring"):
+                    kid = "%s__%s__record-root-k__rep1" % (cell, engine)
+                    kdir = self.runs_dir / kid
+                    kdir.mkdir(parents=True, exist_ok=True)
+                    kwrap = self._sudo(
+                        ["perf", "record", "-o", str(kdir / "perf.data"),
+                         "-e", "cycles:k", "-F", "997",
+                         "--call-graph", "fp", "--"])
+                    krec = self.run_with_retry(
+                        kid, job_text=job, wrap=kwrap, diag=True,
+                        expect_backend=engine_specs(diag=True)[engine][1]
+                        or None, extra={"diag_binary": True})
+                    if krec["status"] == "ok":
+                        self._perf_reports(kdir, "perf-report", callgraph=True)
+
+    def _run_root_readable(self, argv: list) -> subprocess.CompletedProcess:
+        """perf.data written by a root perf may be 0600 root: read it back
+        through sudo when this is a root session."""
+        if self.sudo_pw:
+            proc = subprocess.run(self._sudo(argv), capture_output=True,
+                                  text=True, input=self.sudo_pw + "\n")
+            return proc
+        return subprocess.run(argv, capture_output=True, text=True)
+
+    def _perf_reports(self, run_dir: pathlib.Path, prefix: str,
+                      callgraph: bool) -> None:
+        data_file = run_dir / "perf.data"
+        header = self._run_root_readable(
+            ["perf", "report", "-i", str(data_file), "--header", "--stdio"])
+        (run_dir / ("%s-header.txt" % prefix)).write_text(header.stdout)
+        # callchain view (children sorted) for attribution hierarchy
+        report = self._run_root_readable(
+            ["perf", "report", "-i", str(data_file), "--stdio",
+             "--percent-limit", "0.5"])
+        (run_dir / ("%s.txt" % prefix)).write_text(report.stdout)
+        flat = self._run_root_readable(
+            ["perf", "report", "-i", str(data_file), "--stdio",
+             "--no-children", "-g", "none", "--percent-limit", "0.2"])
+        (run_dir / ("%s-flat.txt" % prefix)).write_text(flat.stdout)
+        (run_dir / "perf.data.sha256").write_text(
+            self._sha256_any(data_file) + "\n")
+        if self.sudo_pw:
+            # evidence must be readable by the (non-root) auditor
+            subprocess.run(self._sudo(["chmod", "644", str(data_file)]),
+                           capture_output=True, text=True,
+                           input=self.sudo_pw + "\n")
+
+    def _sha256_any(self, path: pathlib.Path) -> str:
+        try:
+            return sha256_file(path)
+        except PermissionError:
+            proc = subprocess.run(
+                self._sudo(["sha256sum", str(path)]), capture_output=True,
+                text=True, input=self.sudo_pw + "\n")
+            return proc.stdout.split()[0]
+
+    BPF_SCRIPT = """// Counts only: tracepoint names are resolved by the running kernel;
+// no tracepoint struct layout is hardcoded here.
+tracepoint:syscalls:sys_enter_io_uring_enter { @enter[comm] = count(); }
+tracepoint:io_uring:io_uring_submit_req { @submit[comm] = count(); }
+tracepoint:io_uring:io_uring_queue_async_work { @punt[comm] = count(); }
+tracepoint:io_uring:io_uring_complete { @cqe[comm] = count(); }
+tracepoint:syscalls:sys_enter_futex { @futex[comm] = count(); }
+tracepoint:sched:sched_switch /strcontains(args->prev_comm, "fio") || strcontains(args->prev_comm, "iou-wrk")/ {
+    if (@last[tid] != 0) { @dwell[args->prev_comm] += nsecs - @last[tid]; }
+    @last[tid] = nsecs;
+}
+interval:s:14 { exit(); }
+"""
+
+    def mode_trace_bpf(self, cells, engines) -> None:
+        """Root eBPF counting + scheduling dwell, alongside one measured
+        fio run per (cell, engine). bpftrace counts are exhaustively
+        reported with its own lost-event receipt saved verbatim."""
+        for cell in cells:
+            data = self.prep_file(cell, self.file_size)
+            for engine in engines:
+                job = "\n".join(self.job_lines(
+                    engine, data, cell, ramp_override=0)) + "\n"
+                run_id = "%s__%s__trace-bpf__rep1" % (cell, engine)
+                run_dir = self.runs_dir / run_id
+                run_dir.mkdir(parents=True, exist_ok=True)
+                script = run_dir / "bpf-counts.bt"
+                script.write_text(self.BPF_SCRIPT)
+                out = open(run_dir / "bpftrace.stdout.txt", "w")
+                err = open(run_dir / "bpftrace.stderr.txt", "w")
+                proc = subprocess.Popen(
+                    self._sudo(["timeout", "-s", "INT", "14",
+                                "bpftrace", str(script)]),
+                    stdin=subprocess.PIPE, stdout=out, stderr=err,
+                    text=True)
+                if self.sudo_pw:
+                    proc.stdin.write(self.sudo_pw + "\n")
+                proc.stdin.close()
+                time.sleep(1.0)
+                rec = self.run_with_retry(
+                    run_id, job_text=job,
+                    expect_backend=engine_specs()[engine][1] or None,
+                    extra={"bpf_script": script.name})
+                try:
+                    proc.wait(timeout=40)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()
+                    proc.wait(timeout=10)
+                out.close()
+                err.close()
 
     def mode_trace(self, cells, engines) -> None:
         """strace -c syscall counting on short runs + bare controls +

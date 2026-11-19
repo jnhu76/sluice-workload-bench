@@ -20,6 +20,7 @@ docs/fio-integration/MEASUREMENT-WINDOW-CONTRACT.md.
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import sys
 
@@ -32,7 +33,9 @@ from attribution import runner as runner_mod  # noqa: E402
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("mode", choices=["probe", "clean", "pmu", "record",
-                                     "trace", "crosscheck", "analyze"])
+                                     "trace", "crosscheck", "analyze",
+                                     "pmu-root", "record-root",
+                                     "trace-bpf"])
     ap.add_argument("--results-dir", required=True,
                     help="session directory, e.g. results/attribution/"
                          "session-001")
@@ -52,6 +55,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--cpu-set", default="0-9")
     ap.add_argument("--fio", default="fio")
     ap.add_argument("--fio-diag", default=None)
+    ap.add_argument("--sudo-password-env", default="SLUICE_SUDO_PW",
+                    help="env var carrying the Owner-granted sudo password "
+                         "for root modes; never written to disk")
     args = ap.parse_args()
 
     def csv(name):
@@ -86,10 +92,16 @@ def main() -> int:
                  analysis["cpu_accounting_verdict"]))
         return 0 if analysis["sha_mismatch_free"] else 1
 
+    sudo_pw = None
+    if args.mode in ("pmu-root", "record-root", "trace-bpf"):
+        sudo_pw = os.environ.get(args.sudo_password_env)
+        if not sudo_pw:
+            print("root mode requires --sudo-password-env variable to be set")
+            return 2
     session = runner_mod.Session(
         results, scratch, cpu_set=args.cpu_set, runtime_s=args.runtime,
         ramp_s=args.ramp_time, file_size=args.file_size, fio=args.fio,
-        fio_diag=args.fio_diag)
+        fio_diag=args.fio_diag, sudo_pw=sudo_pw)
     session.ensure_layout()
 
     if args.mode == "probe":
@@ -120,6 +132,14 @@ def main() -> int:
         session.mode_trace(args.cases, args.engines)
     elif args.mode == "crosscheck":
         session.mode_crosscheck(args.engines)
+    elif args.mode == "pmu-root":
+        session.mode_pmu_root(args.cases, args.engines,
+                              repeats=args.repeats or 2)
+    elif args.mode == "record-root":
+        session.mode_record_root(args.cases, args.engines,
+                                 kernel_cycles=not args.no_aux)
+    elif args.mode == "trace-bpf":
+        session.mode_trace_bpf(args.cases, args.engines)
 
     session.write_sha_manifest()
     new_runs = session.manifest_runs[start:]
