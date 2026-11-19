@@ -16,6 +16,16 @@
 #define FIO_SOURCE_TAG "unknown"
 #endif
 
+#ifdef SLUICE_FIO_INIT_SEAM
+// Test-only: the lifecycle test defines this and throws at a chosen
+// init step to prove allocation failures cannot escape the C callback.
+// Compiled out of both shipped .so profiles.
+extern "C" void fio_sluice_init_seam(int step);
+#define FIO_SLUICE_INIT_SEAM(step) fio_sluice_init_seam(step)
+#else
+#define FIO_SLUICE_INIT_SEAM(step) ((void)0)
+#endif
+
 namespace fio_sluice {
 namespace {
 
@@ -86,8 +96,14 @@ int sluice_init(struct thread_data* td) {
         return reject_init(td, "sluice_workers applies to the threadpool backend only");
     }
 
-    auto state = std::make_unique<EngineState>();
+    // One try covers every throwing init step: an allocation failure must
+    // never escape the C callback into fio. The unique_ptr owns the state
+    // until success; EngineState's declaration order tears the scope down
+    // before the context on rollback (SHUT-04).
+    std::unique_ptr<EngineState> state;
     try {
+        FIO_SLUICE_INIT_SEAM(0);
+        state = std::make_unique<EngineState>();
         if (backend == Backend::threadpool) {
             state->context.emplace(sluice::async::make_threadpool_context(
                 {.request_capacity = capacity, .worker_count = eo->workers}));
@@ -110,22 +126,23 @@ int sluice_init(struct thread_data* td) {
         }
         state->scope.emplace(*state->context, capacity,
                              sluice::async::ScopeCleanupPolicy::drain);
+        state->backend = backend;
+        state->capacity = capacity;
+        FIO_SLUICE_INIT_SEAM(1);
+        state->slots.resize(capacity);
+        state->free_slots.reserve(capacity);
+        for (std::size_t i = 0; i < capacity; ++i) {
+            state->free_slots.push_back(capacity - 1 - i);
+        }
+        FIO_SLUICE_INIT_SEAM(2);
+        state->staged.reserve(capacity);
     } catch (const std::exception& error) {
-        log_err("fio-sluice: context construction failed: %s\n", error.what());
+        log_err("fio-sluice: init failed: %s\n", error.what());
         return 1;
     } catch (...) {
-        log_err("fio-sluice: context construction failed: unknown exception\n");
+        log_err("fio-sluice: init failed: unknown exception\n");
         return 1;
     }
-
-    state->backend = backend;
-    state->capacity = capacity;
-    state->slots.resize(capacity);
-    state->free_slots.reserve(capacity);
-    for (std::size_t i = 0; i < capacity; ++i) {
-        state->free_slots.push_back(capacity - 1 - i);
-    }
-    state->staged.reserve(capacity);
 
     log_err("fio-sluice: loaded revision=%s sdk_profile=%s fio_source=%s backend=%s"
             " iodepth=%zu workers=%u\n",
