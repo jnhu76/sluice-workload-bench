@@ -64,15 +64,15 @@ rep 间稳定（native ~0.1%，sluice ~0.2–0.3%），指令差受顺序影响�
   分母 = 同一进程完成的全部 I/O（io_bytes/bs）。仪器语义经实测锁定：
   fio 3.40 的 io_bytes 只覆盖 ramp 后窗口（冒烟回执：io_bytes/bs ==
   iops×runtime 精确成立）。
-- 交叉核验 C2（io_size=20G，ramp=0，clean×3/pmu×2 per engine）：
-  **native io_uring 的 A2 vs C2 指令/op 差 = **1.01%**（双 rep：A2 2775.4 / C2 2747.7）
-  （<10% 预注册界）**；sluice-uring 的跨模式差
-  **7.41%**（A2 8001.1 / C2 8641.2，两 rep 内 <0.1% 一致），TP **4.14%**（A2 7878.3 / C2 8218.8）。
+- 交叉核验 C2（io_size=20G，ramp=0，clean×3/pmu×2 per engine，双 rep）：
+  native io_uring 的 A2 vs C2 指令/op 差 **1.01%**（A2 2775.4 / C2 2747.7，
+  <10% 预注册界）；sluice-uring **7.41%**（A2 8001.1 / C2 8641.2，两 rep
+  内 <0.1% 一致）；TP **4.14%**（A2 7878.3 / C2 8218.8）。
 - **关键限定**：native 的 1% 级差值验证了启动/收尾占比 ≤~1%；但
   sluice 的跨模式差更大且**方向与启动摊销相反**（C2 运行更长、分摊更小，
   per-op 却更高）→ 这是 mode/timing 效应而非启动污染。故 sluice 的
   per-op 值携带该量级的**跨模式不确定度**（≈7.4%），
-  不是 1.13% 的精确窗。判词：`PROCESS_LIFECYCLE_PRIMARY_NATIVE_VERIFIED`。
+  不是 1.01% 的精确窗。判词：`PROCESS_LIFECYCLE_PRIMARY_NATIVE_VERIFIED`。
 - clean（ramp=2）的 rusage 与 io_bytes 窗口不匹配（rusage 含 ramp，
   io_bytes 不含）→ clean 行**不计算 rusage per-op**；窗口匹配的 rusage/op
   只来自 clean0 与 pmu 行（`CLEAN_RAMP2_LIFECYCLE_MISMATCH` 标注）。
