@@ -31,23 +31,49 @@ ramp=2s 与 Phase 1 基线口径一致（clean 不做 per-op PMU 归一）。
   `taskset` 继承同一掩码）。
 - I/O 分母 = 同一进程完成的全部 I/O 数 = fio JSON `jobs[0].read.io_bytes /
   bs`（ramp=0 时窗口即全运行）。旁证：fio stdout ios 计数。
-- 输出标签：`PROCESS_LIFECYCLE_INSTRUCTIONS`、`PROCESS_LIFECYCLE_CYCLES`、
-  `PROCESS_LIFECYCLE_CPU_TIME`（task-clock:u；rusage 旁证 user+sys）。
+- 输出标签（per-op 键统一加 `_per_op` 后缀）：
+  `PROCESS_LIFECYCLE_INSTRUCTIONS_per_op`（`instructions:u`，scope `user`）、
+  `PROCESS_LIFECYCLE_CYCLES_per_op`（`cycles:u`，scope `user`）、
+  `PROCESS_LIFECYCLE_CPU_TIME_us_per_op`（`task-clock`/`task-clock:u`，
+  scope `task_total` = fio 进程树全部线程的 user+sys CPU，**不是 user-only**；
+  `:u` 不改变此语义；不含 io-wq/kworker）。三者共用窗口 =
+  `ramp_time=0` 的整个 fio 进程生命周期，分母 = 同一 run 的
+  `lifecycle_ios`（`read.io_bytes/bs`）。
 - 该数字是**生命周期摊销值**：含 fio 启动（进程创建、动态链接、job 解析、
   文件 open、引擎 init）与 teardown 的成本，不得表述为纯稳定态 per-op。
-  启动/收尾占比由 Option C 界定（下）。
+  启动/收尾占比只能通过 Option C 的交叉核验尝试估计；但 A2/C2 同时改变
+  时间基准，该差值不能单独识别启动成本（见下）。
 
 ### Option C — `AMORTIZED_ESTIMATE`（交叉核验 cell）
 
-- 同负载、`ramp_time=0`、非 time_based、`number_ios=`（定长）：短窗污染仅剩
-  启动+teardown；io 数足够大时摊销误差 → 0。
-- 以 Option C 与 Option B 的每 op 差估计 B 的启动/收尾占比，写入
-  `window-contract.json`（`per_engine.*.delta_pct_of_C`、
-  `startup_share_bound_pct`）。**逐引擎执行**（audit 修正：早期实现只对
-  io_uring 计算）。若某引擎 |B−C|/C > 10%，该引擎的 per-op 结论降级为
-  lifecycle-only，不外推稳定态；若差值方向与启动摊销相反（C2 更长却
-  per-op 更高），按 mode/timing 效应处理而非启动污染，其 per-op 值携带
-  该量级的跨模式不确定度。
+- **有效范围限定**：`AMORTIZED_ESTIMATE` 只对 **native io_uring** 成立；
+  A2/C2 同时改变时间基准（time_based vs fixed-count），每 op 差是启动/收尾
+  摊销与 mode/timing 效应的混合，**不能单独识别为启动成本**。native 1.01%
+  只是 native 总跨模式差上界，**不是“启动/收尾 ≤~1%”的证明，也不是
+  sluice/TP 的精度**。
+- **逐引擎方向检查（含 native）**：native C2 pmu run 更短（8.5–8.8s vs
+  10s）且 per-op 更低；sluice-uring C2（14.0–14.1s）与 TP C2（22.3s）更长
+  且 per-op 更高。三引擎方向均与启动摊销相反 → 机制统一记为
+  `MODE_OR_TIMING_EFFECT_NOT_IDENTIFIED`，**不得解释为启动/收尾成本**；
+  无同口径 per-op 数据时降级为 lifecycle-only，并携带 ≈1.0% / ≈7.4% /
+  ≈4.1% 的跨模式不确定度。
+- 写入 `window-contract.json`：`per_engine.*.delta_pct_of_C`、
+  `startup_share_bound_pct`（历史字段名，实际是 native 总跨模式差上界）、
+  `cross_mode_mechanism = MODE_OR_TIMING_EFFECT_NOT_IDENTIFIED`。预注册
+  10% 门禁不变；>10% 仍降级 lifecycle-only。
+
+### eBPF trace 窗口核验
+
+- `bpf_attach_s + wall_s <= bpf_window_s` 是 `EBPF_COUNTED` 的必要条件。
+  超窗记 `EBPF_WINDOW_OVERSHOOT`：计数只作下界，per-op 用完整
+  `lifecycle_ios` 作分母会系统性偏低。
+- accepted run 是重试时，第一次 attempt 的 bpftrace 回执**不复制**到
+  重试目录；`bpf_retry_outside_window=true` 的 run 记
+  `EBPF_UNAVAILABLE`，其计数不可归属。
+- 旧 run 未持久化 `bpf_window_s` 时，从 job `runtime + ramp + 4` 重建；
+  attach 延迟未记录时用 1s 保守 allowance，并在分析行标
+  `window_basis=RECONSTRUCTED_FROM_JOB` / `attach_basis=ASSUMED_1S`。
+  session-002-root 的 trace-bpf：窗口 14s，`wall_s≈10.39s`，通过。
 
 ### 拒绝项（本轮不使用）
 
@@ -65,6 +91,7 @@ ramp=2s 与 Phase 1 基线口径一致（clean 不做 per-op PMU 归一）。
 | `user` | `:u` 事件 —— 仅用户态执行（本机 paranoid=2 下非 root 唯一可用域） |
 | `kernel` | `:k` 事件 —— 本轮非 root `UNAVAILABLE`，不得用 0 冒充 |
 | `process` | fio 进程树全部线程（perf/rusage 天然作用域） |
+| `task_total` | `task-clock` 的 CPU 时间作用域 = fio 进程树全部线程的 user+sys，**不是 user-only**；不含 io-wq/kworker |
 | `io-wq/kworker` | 内核线程 —— 非 root `NOT_MEASURED`，判 `PARTIAL_CPU_ACCOUNTING` |
 | `counted` | 精确计数（perf stat 非 multiplex；strace -c 计数） |
 | `sampled` | perf record 采样归因 —— 只作函数级归因，不作精确 per-op 计数 |
@@ -83,9 +110,9 @@ ramp=2s 与 Phase 1 基线口径一致（clean 不做 per-op PMU 归一）。
 
 | 指标 | 来源 | 窗口 | 分母 |
 | --- | --- | --- | --- |
-| instructions/op | perf stat `instructions:u` | 进程生命周期 | lifecycle ios |
-| cycles/op | perf stat `cycles:u` | 同上 | 同上 |
-| CPU time/op | `task-clock:u`（= 进程树 user+sys，非 user-only；与 rusage(u+s) 精确吻合） | 同上 | 同上 |
+| instructions/op（`PROCESS_LIFECYCLE_INSTRUCTIONS_per_op`） | perf stat `instructions:u` | `ramp_time=0` 进程生命周期 | 同 run 的 `lifecycle_ios` |
+| cycles/op（`PROCESS_LIFECYCLE_CYCLES_per_op`） | perf stat `cycles:u` | 同上 | 同上 |
+| CPU time/op（`PROCESS_LIFECYCLE_CPU_TIME_us_per_op`） | `task-clock`/`task-clock:u`（scope `task_total` = 进程树 user+sys，非 user-only；与 rusage(u+s) 精确吻合） | 同上 | 同上 |
 | ctx switches/op | perf `context-switches` + rusage nvcsw+nivcsw | 同上 | 同上 |
 | io_uring_enter/op | strace -c `io_uring_enter` 计数 | straced 进程 | 同 run 的 lifecycle ios |
 | futex/op | strace -c `futex` 计数 | 同上 | 同上 |
@@ -107,3 +134,9 @@ ramp=2s 与 Phase 1 基线口径一致（clean 不做 per-op PMU 归一）。
 - 首次正式测量前的冒烟会话发现 fio `io_bytes` 仅覆盖 ramp 后窗口，故
   插桩模式固定 `ramp_time=0` —— 此次修正发生在正式测量开始前（14:29
   冻结，14:31 首 run），不属于事后调整。
+- **修复轮修订（独立复核后，阈值未变）**：① per-op 键统一加 `_per_op`
+  后缀，`task-clock` 的 scope 明确为 `task_total`（进程树 user+sys，非
+  user-only）；② `AMORTIZED_ESTIMATE` 限定为 native 交叉核验的上界，
+  A2/C2 差值不能识别启动成本，统一记
+  `MODE_OR_TIMING_EFFECT_NOT_IDENTIFIED`。预注册 10% 门禁与
+  `ramp_time=0` 口径均未调整，本次只修正标签与解释边界。

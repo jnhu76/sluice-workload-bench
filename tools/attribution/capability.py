@@ -25,11 +25,17 @@ AUX2_EVENTS = ("L1-dcache-loads:u", "LLC-loads:u")
 KERNEL_EVENT = "cycles:k"
 
 
-def _run(argv: list, timeout: float = 20.0, env=None) -> dict:
-    """Run a probe command, returning verbatim receipt material."""
+def _run(argv: list, timeout: float = 20.0, env=None,
+         input_text: str | None = None) -> dict:
+    """Run a probe command, returning verbatim receipt material.
+
+    `input_text` is only used for `sudo -S` probes; the password never
+    enters argv, meta.json, the evidence tree or git.
+    """
     try:
         proc = subprocess.run(argv, capture_output=True, text=True,
-                              timeout=timeout, env=env)
+                              timeout=timeout, env=env,
+                              input=input_text)
         return {"argv": argv, "returncode": proc.returncode,
                 "stdout": proc.stdout[-4000:], "stderr": proc.stderr[-4000:]}
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -37,19 +43,32 @@ def _run(argv: list, timeout: float = 20.0, env=None) -> dict:
                 "stderr": "%s: %s" % (type(exc).__name__, exc)}
 
 
+def _sudo_argv(argv: list, sudo_pw: str | None) -> tuple[list, str | None]:
+    """Owner-granted root probes: password only via sudo -S stdin."""
+    if not sudo_pw:
+        return argv, None
+    return ["sudo", "-S", "-p", ""] + argv, sudo_pw + "\n"
+
+
 def _which(name: str, env=None) -> str | None:
     return shutil.which(name, path=(env or os.environ).get("PATH"))
 
 
-def probe_perf_event(event: str, env=None) -> dict:
-    """Count one event against /bin/true; classify from the raw receipt."""
+def probe_perf_event(event: str, env=None, sudo_pw: str | None = None) -> dict:
+    """Count one event against /bin/true; classify from the raw receipt.
+
+    With an Owner-granted sudo password the probe itself runs as root --
+    otherwise a session measured through root modes would still record
+    kernel_cycles/ebpf as UNAVAILABLE (audit finding R1-4).
+    """
     perf = _which("perf", env)
     if perf is None:
         return {"status": "UNAVAILABLE",
                 "reason": "perf binary not found on PATH",
                 "evidence": "which perf -> not found"}
-    receipt = _run([perf, "stat", "-x,", "-e", event, "--", "/bin/true"],
-                   env=env)
+    argv, input_text = _sudo_argv(
+        [perf, "stat", "-x,", "-e", event, "--", "/bin/true"], sudo_pw)
+    receipt = _run(argv, env=env, input_text=input_text)
     out = receipt["stdout"] + receipt["stderr"]
     if "<not counted>" in out or "<not supported>" in out:
         return {"status": "UNAVAILABLE", "reason": "not counted/supported",
@@ -64,7 +83,8 @@ def probe_perf_event(event: str, env=None) -> dict:
     return {"status": "SUPPORTED", "reason": "", "evidence": receipt}
 
 
-def probe_sw_event_effective(event: str, env=None) -> dict:
+def probe_sw_event_effective(event: str, env=None,
+                             sudo_pw: str | None = None) -> dict:
     """Software events under paranoid=2: perf silently sets exclude_kernel,
     so kernel-occurring SW events (context switches, migrations) count as
     ZERO even under heavy scheduling. A zero on a switching workload means
@@ -76,8 +96,10 @@ def probe_sw_event_effective(event: str, env=None) -> dict:
         return {"status": "UNAVAILABLE", "reason": "perf not found",
                 "evidence": "which perf -> not found"}
     # nanosleep entry/exit guarantees voluntary context switches.
-    receipt = _run([perf, "stat", "-x,", "-e", event, "--",
-                    "/bin/sh", "-c", "sleep 0.05"], env=env)
+    argv, input_text = _sudo_argv(
+        [perf, "stat", "-x,", "-e", event, "--",
+         "/bin/sh", "-c", "sleep 0.05"], sudo_pw)
+    receipt = _run(argv, env=env, input_text=input_text)
     out = receipt["stdout"] + receipt["stderr"]
     row = None
     for line in out.splitlines():
@@ -101,37 +123,62 @@ def probe_sw_event_effective(event: str, env=None) -> dict:
     return {"status": "SUPPORTED", "reason": "", "evidence": receipt}
 
 
-def probe_tracepoints() -> dict:
-    """tracefs visibility without root: can we enumerate io_uring events?"""
+def probe_tracepoints(sudo_pw: str | None = None) -> dict:
+    """tracefs visibility: enumerate io_uring events as the caller, or
+    through Owner-granted sudo when a password is supplied."""
+    last_error = None
     for base in ("/sys/kernel/tracing", "/sys/kernel/debug/tracing"):
         events = pathlib.Path(base) / "events" / "io_uring"
         try:
             names = sorted(p.name for p in events.iterdir())
         except OSError as exc:
-            return {"status": "UNAVAILABLE",
-                    "reason": "tracefs events not readable: %s" % exc,
-                    "evidence": {"path": str(events)}}
+            last_error = exc
+            if sudo_pw:
+                argv, input_text = _sudo_argv(
+                    ["ls", "-1", str(events)], sudo_pw)
+                receipt = _run(argv, input_text=input_text)
+                if receipt["returncode"] == 0:
+                    names = sorted(ln.strip() for ln in
+                                   receipt["stdout"].splitlines()
+                                   if ln.strip())
+                    if names:
+                        return {"status": "SUPPORTED", "reason": "",
+                                "evidence": {"path": str(events),
+                                             "events": names,
+                                             "elevation": "sudo -S"}}
+            continue
         if names:
             return {"status": "SUPPORTED", "reason": "",
                     "evidence": {"path": str(events), "events": names}}
+    if last_error is not None:
+        return {"status": "UNAVAILABLE",
+                "reason": "tracefs events not readable: %s" % last_error,
+                "evidence": {}}
     return {"status": "UNAVAILABLE", "reason": "no tracefs mount",
             "evidence": {}}
 
 
-def probe_bpftrace(env=None) -> dict:
+def probe_bpftrace(env=None, sudo_pw: str | None = None) -> dict:
     path = _which("bpftrace", env)
     if path is None:
         return {"status": "UNAVAILABLE", "reason": "bpftrace not on PATH",
                 "evidence": "which bpftrace -> not found"}
-    receipt = _run(["bpftrace", "-e", "BEGIN { @x = count(); exit(); }"],
-                   timeout=15, env=env)
+    argv, input_text = _sudo_argv(
+        [path, "-e", "BEGIN { @x = count(); exit(); }"], sudo_pw)
+    receipt = _run(argv, timeout=15, env=env, input_text=input_text)
     if receipt["returncode"] == 0:
         return {"status": "SUPPORTED", "reason": "", "evidence": receipt}
     reason = "root required" if "root" in receipt["stderr"] else "probe failed"
     return {"status": "UNAVAILABLE", "reason": reason, "evidence": receipt}
 
 
-def probe_perf_record(env=None) -> dict:
+def probe_perf_record(env=None, sudo_pw: str | None = None) -> dict:
+    """Probe :u record and dwarf/fp callgraphs.
+
+    With an Owner-granted sudo password the probe runs as root, so the
+    capability matrix describes the same elevation as record-root. The
+    password travels only on sudo -S stdin.
+    """
     perf = _which("perf", env)
     if perf is None:
         return {"status": "UNAVAILABLE", "reason": "perf binary not found",
@@ -150,18 +197,24 @@ def probe_perf_record(env=None) -> dict:
 
     with tempfile.TemporaryDirectory() as tmp:
         data = pathlib.Path(tmp) / "probe.data"
-        receipt = _run([perf, "record", "-o", str(data), "-e", "cycles:u",
-                        "-F", "99", "--", "/bin/true"], env=env)
+        argv, input_text = _sudo_argv(
+            [perf, "record", "-o", str(data), "-e", "cycles:u",
+             "-F", "99", "--", "/bin/true"], sudo_pw)
+        receipt = _run(argv, env=env, input_text=input_text)
         ok = record_ok(receipt, data)
-        report = _run([perf, "report", "-i", str(data), "--stdio",
-                       "--percent-limit", "0"], env=env)
+        argv, input_text = _sudo_argv(
+            [perf, "report", "-i", str(data), "--stdio",
+             "--percent-limit", "0"], sudo_pw)
+        report = _run(argv, env=env, input_text=input_text)
         symbols = any(s in report["stdout"] for s in ("true", "ld.so", "_start"))
         graphs = {}
         for kind in ("dwarf", "fp"):
             data.unlink(missing_ok=True)
-            r = _run([perf, "record", "-o", str(data), "-e", "cycles:u",
-                      "-F", "99", "--call-graph", kind, "--", "/bin/true"],
-                     env=env)
+            argv, input_text = _sudo_argv(
+                [perf, "record", "-o", str(data), "-e", "cycles:u",
+                 "-F", "99", "--call-graph", kind, "--", "/bin/true"],
+                sudo_pw)
+            r = _run(argv, env=env, input_text=input_text)
             graphs[kind] = {"ok": record_ok(r, data), "receipt": r}
         status = ("SUPPORTED" if ok and symbols
                   else "PARTIAL" if ok else "UNAVAILABLE")
@@ -176,7 +229,16 @@ def probe_perf_record(env=None) -> dict:
                              "report_head": report["stdout"][:2000]}}
 
 
-def probe_sudo_root() -> dict:
+def probe_sudo_root(sudo_pw: str | None = None) -> dict:
+    if sudo_pw:
+        argv, input_text = _sudo_argv(["true"], sudo_pw)
+        receipt = _run(argv, input_text=input_text)
+        return {"status": "SUPPORTED" if receipt["returncode"] == 0
+                else "UNAVAILABLE",
+                "reason": "Owner-granted sudo password (stdin only)"
+                if receipt["returncode"] == 0 else "sudo -S probe failed",
+                "evidence": {k: v for k, v in receipt.items()
+                             if k != "input_text"}}
     receipt = _run(["sudo", "-n", "true"])
     return {"status": "SUPPORTED" if receipt["returncode"] == 0
             else "UNAVAILABLE",
@@ -252,8 +314,13 @@ def collect_environment(env=None) -> dict:
     }
 
 
-def probe_all(env=None) -> dict:
-    """Capability matrix per the campaign directive (G1 table)."""
+def probe_all(env=None, sudo_pw: str | None = None) -> dict:
+    """Capability matrix per the campaign directive (G1 table).
+
+    When an Owner-granted sudo password is supplied, the :k / tracepoint /
+    bpftrace probes run through `sudo -S` so the matrix describes the
+    measured root session instead of the invoking user.
+    """
     perf_present = _which("perf", env) is not None
 
     def group(events: tuple) -> dict:
@@ -261,7 +328,8 @@ def probe_all(env=None) -> dict:
             return {"status": "UNAVAILABLE",
                     "reason": "perf binary not found",
                     "evidence": "which perf -> not found", "events": {}}
-        rows = {e: probe_perf_event(e, env=env) for e in events}
+        rows = {e: probe_perf_event(e, env=env, sudo_pw=sudo_pw)
+                for e in events}
         ok = [e for e, r in rows.items() if r["status"] == "SUPPORTED"]
         return {
             "status": ("SUPPORTED" if len(ok) == len(events)
@@ -271,25 +339,29 @@ def probe_all(env=None) -> dict:
             "events": rows,
         }
 
-    sudo = probe_sudo_root()
-    root_like = sudo["status"] == "SUPPORTED" or os.geteuid() == 0
-    tracepoints = probe_tracepoints()
+    sudo = probe_sudo_root(sudo_pw)
+    root_like = (sudo["status"] == "SUPPORTED" or os.geteuid() == 0)
+    tracepoints = probe_tracepoints(sudo_pw)
 
     matrix = {
         "schema": 1,
         "as_user": os.environ.get("USER"),
         "effective_uid": os.geteuid(),
+        "elevation": "sudo -S (password via stdin only)" if sudo_pw
+        else "none (invoking user)" if os.geteuid() != 0 else "root",
         "passwordless_sudo": sudo,
-        "user_instructions": probe_perf_event("instructions:u", env),
-        "user_cycles": probe_perf_event("cycles:u", env),
-        "kernel_cycles": probe_perf_event(KERNEL_EVENT, env),
-        "task_clock": probe_perf_event("task-clock:u", env),
-        "context_switches": probe_sw_event_effective("context-switches",
-                                                     env),
-        "cpu_migrations": probe_sw_event_effective("cpu-migrations", env),
+        "user_instructions": probe_perf_event("instructions:u", env,
+                                              sudo_pw),
+        "user_cycles": probe_perf_event("cycles:u", env, sudo_pw),
+        "kernel_cycles": probe_perf_event(KERNEL_EVENT, env, sudo_pw),
+        "task_clock": probe_perf_event("task-clock:u", env, sudo_pw),
+        "context_switches": probe_sw_event_effective(
+            "context-switches", env, sudo_pw),
+        "cpu_migrations": probe_sw_event_effective(
+            "cpu-migrations", env, sudo_pw),
         "cache_llc_events": group(AUX2_EVENTS),
         "branch_events": group(AUX1_EVENTS[:2]),
-        "perf_callgraph_user": probe_perf_record(env),
+        "perf_callgraph_user": probe_perf_record(env, sudo_pw),
         "io_uring_tracepoints": tracepoints,
         "sched_tracepoints": {
             "status": tracepoints["status"],
@@ -304,17 +376,19 @@ def probe_all(env=None) -> dict:
             "evidence": {"note": "futex tracepoint enumerates under the same "
                                  "tracefs read scope"},
         },
-        "ebpf_bpftrace": probe_bpftrace(env),
+        "ebpf_bpftrace": probe_bpftrace(env, sudo_pw),
         "io_wq_worker_attribution": {
             "status": "UNAVAILABLE",
-            "reason": "requires kernel tracepoints or :k PMU (root); "
-                      "non-root cannot attribute io-wq CPU",
+            "reason": "worker keys are system-wide comm matches; io-wq CPU "
+                      "is not attributed to this run (root tracepoints do "
+                      "not by themselves provide a per-run owner)",
             "evidence": {"kernel_cycles": "see kernel_cycles row",
                          "tracepoints": tracepoints["status"]},
         },
         "block_layer_events": {
             "status": "UNAVAILABLE" if not root_like else "SUPPORTED",
-            "reason": "tracefs read denied without root",
+            "reason": ("" if root_like else
+                       "tracefs read denied without root"),
             "evidence": tracepoints["evidence"],
         },
         "user_probes": {
@@ -324,13 +398,33 @@ def probe_all(env=None) -> dict:
         },
     }
 
-    # Aggregate verdict used by the session gate.
+    # Aggregate verdict used by the session gate. The name is deliberate:
+    # the verdict only covers the scopes probed here. Even as root it does
+    # NOT mean whole-system CPU accounting: io-wq/kworker attribution,
+    # IRQ/softirq cost and per-request K/R/P/O joins stay out of scope.
     core_user_pmu = (matrix["user_instructions"]["status"] == "SUPPORTED"
                      and matrix["user_cycles"]["status"] == "SUPPORTED")
     kernel_side = (matrix["kernel_cycles"]["status"] == "SUPPORTED"
                    and matrix["ebpf_bpftrace"]["status"] == "SUPPORTED")
+    measured = []
+    if core_user_pmu:
+        measured.append("user PMU (:u)")
+    if matrix["kernel_cycles"]["status"] == "SUPPORTED":
+        measured.append("kernel PMU (:k)")
+    if matrix["ebpf_bpftrace"]["status"] == "SUPPORTED":
+        measured.append("bpftrace/eBPF aggregate counters")
+    if matrix["perf_callgraph_user"].get("callgraph_dwarf"):
+        measured.append("perf callgraph (dwarf)")
+    matrix["cpu_accounting_scopes"] = {
+        "measured": measured,
+        "not_measured": [
+            "io-wq/kworker CPU attributed to this run",
+            "IRQ/softirq system cost",
+            "per-request K/R/P/O causal join",
+        ],
+    }
     if core_user_pmu and kernel_side:
-        matrix["cpu_accounting_verdict"] = "FULL"
+        matrix["cpu_accounting_verdict"] = "FULL_FOR_MEASURED_SCOPES"
     elif core_user_pmu:
         matrix["cpu_accounting_verdict"] = "PARTIAL_CPU_ACCOUNTING"
     else:
@@ -338,8 +432,9 @@ def probe_all(env=None) -> dict:
     return matrix
 
 
-def write_capability(path: pathlib.Path, env=None) -> dict:
-    matrix = probe_all(env)
+def write_capability(path: pathlib.Path, env=None,
+                     sudo_pw: str | None = None) -> dict:
+    matrix = probe_all(env, sudo_pw)
     path.write_text(json.dumps(matrix, indent=2, sort_keys=True) + "\n")
     return matrix
 

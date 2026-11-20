@@ -39,6 +39,11 @@ CELLS = {
     "A2": {"rw": "randread", "bs": "4k", "iodepth": 16, "kind": "time_based"},
     "A3": {"rw": "read", "bs": "64k", "iodepth": 4, "kind": "time_based"},
     "A4": {"rw": "randread", "bs": "4k", "iodepth": 4, "kind": "time_based"},
+    # Baseline U4 (deep-queue endpoint): same 4k randread shape as A1/A2/A4
+    # at iodepth 64. Added for the userspace-cost baseline session only;
+    # DEFAULT_CELLS deliberately stays A1-A4 so existing grids are
+    # unchanged.
+    "A5": {"rw": "randread", "bs": "4k", "iodepth": 64, "kind": "time_based"},
     # Option C cross-check: working set stays 1G (same as A2) while the
     # total transferred is 20G == 5.24M ios, giving a long, startup-
     # amortized window (fio semantics: size = working set, io_size = total;
@@ -73,6 +78,20 @@ def sha256_file(path: pathlib.Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def is_stripped(path: pathlib.Path) -> bool | None:
+    """Ask `file` instead of hardcoding a boolean into the manifest."""
+    proc = subprocess.run(["file", "-b", str(path)],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    text = proc.stdout.lower()
+    if "not stripped" in text:
+        return False
+    if "stripped" in text:
+        return True
+    return None
 
 
 def text_section_sha256(path: pathlib.Path) -> str | None:
@@ -147,7 +166,10 @@ class Session:
         env = cap.collect_environment()
         (self.root / "environment.json").write_text(
             json.dumps(env, indent=2, sort_keys=True) + "\n")
-        matrix = cap.probe_all()
+        # Root modes measure through `sudo -S`; the capability probe must
+        # run under the same elevation or it would record UNAVAILABLE for
+        # capabilities the session actually measured.
+        matrix = cap.probe_all(sudo_pw=self.sudo_pw)
         (self.root / "capability.json").write_text(
             json.dumps(matrix, indent=2, sort_keys=True) + "\n")
         return matrix
@@ -173,15 +195,19 @@ class Session:
                 row["text_sha256"] = t_rel
             rows[name] = row
         diag_fio = pathlib.Path(self.fio_diag)
+        fio_baseline_path = pathlib.Path(shutil.which(self.fio) or self.fio)
         manifest = {
             "schema": 1,
             "sluice_revision": self.revision,
-            "fio_baseline": {"path": shutil.which(self.fio) or self.fio,
-                             "version": subprocess.run(
-                                 [self.fio, "--version"],
-                                 capture_output=True, text=True).stdout
-                             .strip(),
-                             "stripped": True},
+            "fio_baseline": {
+                "path": str(fio_baseline_path),
+                "version": subprocess.run(
+                    [self.fio, "--version"],
+                    capture_output=True, text=True).stdout.strip(),
+                "sha256": (sha256_file(fio_baseline_path)
+                           if fio_baseline_path.is_file() else None),
+                "stripped": (is_stripped(fio_baseline_path)
+                             if fio_baseline_path.is_file() else None)},
             "fio_diag": ({"path": str(diag_fio),
                           "sha256": sha256_file(diag_fio),
                           "text_sha256": text_section_sha256(diag_fio)}
@@ -288,13 +314,23 @@ class Session:
                           "numjobs=1", "direct=0", "thread=1",
                           "group_reporting=1", "randseed=%d" % RANDSEED,
                           "invalidate=0", "buffer_pattern=0x5a"] + list(extra)
-        self.run_fio("prep-%s-write" % label,
-                     "\n".join(lines("psync", "write", "1m",
-                                     ("fsync_on_close=1",))) + "\n",
-                     expect_backend=None, timeout_s=900)
-        self.run_fio("prep-%s-warm" % label,
-                     "\n".join(lines("io_uring", "read", "1m")) + "\n",
-                     expect_backend=None, timeout_s=900)
+        write_rec = self.run_fio(
+            "prep-%s-write" % label,
+            "\n".join(lines("psync", "write", "1m",
+                            ("fsync_on_close=1",))) + "\n",
+            expect_backend=None, timeout_s=900)
+        if write_rec["status"] != "ok":
+            raise EnvironmentDrift(
+                "prep write failed for %s: %s"
+                % (label, write_rec.get("failures")))
+        warm_rec = self.run_fio(
+            "prep-%s-warm" % label,
+            "\n".join(lines("io_uring", "read", "1m")) + "\n",
+            expect_backend=None, timeout_s=900)
+        if warm_rec["status"] != "ok":
+            raise EnvironmentDrift(
+                "prep warm-read failed for %s: %s"
+                % (label, warm_rec.get("failures")))
         self.prepared_files[label] = data
         return data
 
@@ -317,6 +353,11 @@ class Session:
             "stderr_tail": proc.stderr.splitlines()[-8:],
             "started_unix": int(time.time()),
         }
+        # Full stderr is kept for S4 (stderr RESEARCH_COUNTERS line vs
+        # SLUICE_FIO_RESEARCH_COUNTERS_FILE) and for tripwire auditing.
+        # stderr_tail stays for backwards-compatible manifests.
+        (run_dir / "stderr.txt").write_text(proc.stderr)
+        (run_dir / "stdout.txt").write_text(proc.stdout)
         load = LOAD_RE.search(proc.stderr)
         record["engine_load"] = list(load.groups()) if load else None
         diag = [ln.strip() for ln in proc.stderr.splitlines()
@@ -360,10 +401,13 @@ class Session:
         try:
             doc = json.loads(stdout[start:])
             job = doc["jobs"][0]
-            return bool(job.get("read", {}).get("io_bytes"))
+            # Write-only prep runs legitimately have no read.io_bytes.
+            for direction in ("read", "write"):
+                if (job.get(direction) or {}).get("io_bytes"):
+                    return True
+            return False
         except (ValueError, KeyError, IndexError, TypeError):
             return False
-        return True
 
     def run_fio(self, run_id: str, job_text: str, expect_backend=None,
                 timeout_s=None, wrap: list | None = None, diag: bool = False,
@@ -429,7 +473,67 @@ class Session:
             rec["status"] = "fail"
             (run_dir / "meta.json").write_text(
                 json.dumps(rec, indent=2, sort_keys=True) + "\n")
+            # Keep runs-manifest consistent with the on-disk meta.
+            for entry in reversed(self.manifest_runs):
+                if entry.get("run_id") == run_id:
+                    entry["status"] = "fail"
+                    break
+            (self.root / "runs-manifest.json").write_text(
+                json.dumps(self.manifest_runs, indent=2) + "\n")
         return rec
+
+    def accepted_run_dir(self, rec: dict) -> pathlib.Path:
+        """The directory that holds the ACCEPTED receipt. On retry this is
+        `<attempt_id>r`, not the caller's first-attempt path; post-run
+        artifacts (perf reports, bpftrace receipts, strace annotations)
+        must be written there or the accepted row has no instrumentation."""
+        return self.runs_dir / rec["run_id"]
+
+    def _bpf_source_dir(self, attempt_dir: pathlib.Path) -> pathlib.Path:
+        """The attempt dir may have been renamed to `<id>-failed*` when
+        run_fio re-used a previously failed run_id. The live bpftrace
+        files moved with it; locate the renamed directory instead of
+        copying from a path that no longer exists."""
+        if (attempt_dir / "bpftrace.stdout.txt").exists():
+            return attempt_dir
+        candidates = [p for p in self.runs_dir.glob(
+            attempt_dir.name + "-failed*")
+            if (p / "bpftrace.stdout.txt").exists()]
+        if candidates:
+            return max(candidates, key=lambda p: p.stat().st_mtime)
+        return attempt_dir
+
+    def _mark_missing_artifact(self, rec: dict, artifact: str) -> None:
+        run_dir = self.accepted_run_dir(rec)
+        meta_path = run_dir / "meta.json"
+        if not meta_path.exists():
+            return
+        meta = json.loads(meta_path.read_text())
+        meta.setdefault("failures", []).append(
+            "%s missing after a successful run" % artifact)
+        meta["status"] = "fail"
+        meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True)
+                             + "\n")
+        for entry in reversed(self.manifest_runs):
+            if entry.get("run_id") == rec["run_id"]:
+                entry["status"] = "fail"
+                break
+        (self.root / "runs-manifest.json").write_text(
+            json.dumps(self.manifest_runs, indent=2) + "\n")
+
+    @staticmethod
+    def _retarget_wrap(kwargs: dict, attempt_id: str,
+                       retry_id: str) -> dict:
+        """Retry must not write its instrumentation artifacts into the
+        discarded first-attempt directory. The caller built `wrap` from
+        attempt_id, so rewrite only the /runs/<id>/ path component."""
+        out = dict(kwargs)
+        wrap = out.get("wrap")
+        if wrap:
+            old = "/runs/%s/" % attempt_id
+            new = "/runs/%s/" % retry_id
+            out["wrap"] = [arg.replace(old, new) for arg in wrap]
+        return out
 
     def run_with_retry(self, attempt_id: str, **kwargs) -> dict:
         """Pre-registered discard rule: a failed run is kept with
@@ -444,7 +548,9 @@ class Session:
                                                sort_keys=True) + "\n")
                 self.manifest_runs[-1]["status"] = "discarded"
             retry_id = attempt_id + "r"
-            rec2 = self.run_fio(retry_id, **kwargs)
+            rec2 = self.run_fio(retry_id,
+                                **self._retarget_wrap(kwargs, attempt_id,
+                                                      retry_id))
             if rec2["status"] != "ok":
                 rec2["arm_blocked"] = True
             return rec2
@@ -524,7 +630,14 @@ class Session:
                     extra={"diag_binary": True})
                 if rec["status"] != "ok":
                     continue
+                # The accepted run may be the retry directory; reports must
+                # be attached to the accepted receipt, never to the
+                # discarded first attempt (audit R1-1).
+                run_dir = self.accepted_run_dir(rec)
                 data_file = run_dir / "perf.data"
+                if not data_file.exists():
+                    self._mark_missing_artifact(rec, "perf.data")
+                    continue
                 header = subprocess.run(
                     ["perf", "report", "-i", str(data_file), "--header",
                      "--stdio"], capture_output=True, text=True)
@@ -552,7 +665,9 @@ class Session:
 
     def mode_pmu_root(self, cells, engines, repeats: int = 2) -> None:
         """Root PMU grids: user/kernel split plus scheduling/cache events.
-        Three orthogonal groups keep every event at 100% time-running."""
+        g1/g2 keep their core events at 100% time-running; g3 is an
+        auxiliary group with six hardware events and its counters may be
+        multiplexed (SCALED), so they never enter exact per-op tables."""
         from .capability import MAIN_EVENTS  # noqa: F401 (non-root groups)
         groups = (
             ("pmu-root-g1", ("instructions:u", "instructions:k",
@@ -601,8 +716,12 @@ class Session:
                     expect_backend=engine_specs(diag=True)[engine][1] or None,
                     extra={"diag_binary": True})
                 if rec["status"] == "ok":
-                    self._perf_reports(run_dir, "perf-report",
-                                       callgraph=True)
+                    run_dir = self.accepted_run_dir(rec)
+                    if (run_dir / "perf.data").exists():
+                        self._perf_reports(run_dir, "perf-report",
+                                           callgraph=True)
+                    else:
+                        self._mark_missing_artifact(rec, "perf.data")
                 if kernel_cycles and engine in ("io_uring", "sluice-uring"):
                     kid = "%s__%s__record-root-k__rep1" % (cell, engine)
                     kdir = self.runs_dir / kid
@@ -616,7 +735,12 @@ class Session:
                         expect_backend=engine_specs(diag=True)[engine][1]
                         or None, extra={"diag_binary": True})
                     if krec["status"] == "ok":
-                        self._perf_reports(kdir, "perf-report", callgraph=True)
+                        kdir = self.accepted_run_dir(krec)
+                        if (kdir / "perf.data").exists():
+                            self._perf_reports(kdir, "perf-report",
+                                               callgraph=True)
+                        else:
+                            self._mark_missing_artifact(krec, "perf.data")
 
     def _run_root_readable(self, argv: list) -> subprocess.CompletedProcess:
         """perf.data written by a root perf may be 0600 root: read it back
@@ -659,12 +783,16 @@ class Session:
         try:
             return sha256_file(path)
         except PermissionError:
+            if not self.sudo_pw:
+                return "UNREADABLE"
             proc = subprocess.run(
                 self._sudo(["sha256sum", str(path)]), capture_output=True,
                 text=True, input=self.sudo_pw + "\n")
+            if proc.returncode != 0 or not proc.stdout.split():
+                return "UNREADABLE"
             return proc.stdout.split()[0]
 
-    BPF_SCRIPT = """// Counts only: tracepoint names are resolved by the running kernel;
+    BPF_SCRIPT_TEMPLATE = """// Counts only: tracepoint names are resolved by the running kernel;
 // no tracepoint struct layout is hardcoded here.
 tracepoint:syscalls:sys_enter_io_uring_enter { @enter[comm] = count(); }
 tracepoint:io_uring:io_uring_submit_req { @submit[comm] = count(); }
@@ -674,21 +802,53 @@ tracepoint:syscalls:sys_enter_futex { @futex[comm] = count(); }
 // on-CPU dwell: arm at switch-IN, account at switch-OUT (two probes;
 // a single prev_comm probe would measure wall time between switches)
 // key by pid: sched_switch runs in the outgoing task's context, so the
-// incoming task's identity comes from args->next_pid, not tid
+// incoming task's identity comes from args->next_pid, not tid.
+// prev_pid/next_pid are TIDs: with fio thread=1 the job is a thread of
+// the fio process (TID != TGID), and @dwell is summed per comm, i.e.
+// over every comm=fio thread, not over the submitting TID. Comm keys
+// carry no pid/tgid, so these counters are host-isolated aggregates.
 tracepoint:sched:sched_switch /strcontains(args->next_comm, "fio") || strcontains(args->next_comm, "iou-wrk")/ {
     @start[args->next_pid] = nsecs;
 }
 tracepoint:sched:sched_switch /strcontains(args->prev_comm, "fio") || strcontains(args->prev_comm, "iou-wrk")/ {
-    if (@start[args->prev_pid] != 0) { @dwell[args->prev_comm] += nsecs - @start[args->prev_pid]; }
-    delete(@start[args->prev_pid]);
+    if (@start[args->prev_pid] != 0) {
+        @dwell[args->prev_comm] += nsecs - @start[args->prev_pid];
+        delete(@start[args->prev_pid]);
+    } else {
+        @missing_start[args->prev_comm] = count();
+    }
 }
-interval:s:14 { exit(); }
+interval:s:%(window)d { exit(); }
 """
+
+    def bpf_script(self, window_s: int) -> str:
+        return self.BPF_SCRIPT_TEMPLATE % {"window": window_s}
+
+    @staticmethod
+    def _wait_for_attach(err_path, proc, timeout: float = 10.0) -> str:
+        """Wait for bpftrace's `Attached N probes` receipt. A fixed sleep
+        cannot prove attach; a slow attach would silently truncate the
+        first ios and leave the denominator intact."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                text = pathlib.Path(err_path).read_text(errors="replace")
+            except OSError:
+                text = ""
+            for line in text.splitlines():
+                if line.strip().startswith("Attached "):
+                    return line.strip()
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        return ""
 
     def mode_trace_bpf(self, cells, engines) -> None:
         """Root eBPF counting + scheduling dwell, alongside one measured
-        fio run per (cell, engine). bpftrace counts are exhaustively
-        reported with its own lost-event receipt saved verbatim."""
+        fio run per (cell, engine). Counters are comm-keyed host
+        aggregates (HOST_ISOLATED_AGGREGATE); bpftrace's lost-event
+        receipt is saved verbatim, but it only covers perf-ring drops."""
+        window_s = int(self.runtime_s + self.ramp_s + 4)
         for cell in cells:
             data = self.prep_file(cell, self.file_size)
             for engine in engines:
@@ -698,29 +858,86 @@ interval:s:14 { exit(); }
                 run_dir = self.runs_dir / run_id
                 run_dir.mkdir(parents=True, exist_ok=True)
                 script = run_dir / "bpf-counts.bt"
-                script.write_text(self.BPF_SCRIPT)
+                script.write_text(self.bpf_script(window_s))
                 out = open(run_dir / "bpftrace.stdout.txt", "w")
                 err = open(run_dir / "bpftrace.stderr.txt", "w")
                 proc = subprocess.Popen(
-                    self._sudo(["timeout", "-s", "INT", "14",
+                    self._sudo(["timeout", "-s", "INT", str(window_s),
                                 "bpftrace", str(script)]),
                     stdin=subprocess.PIPE, stdout=out, stderr=err,
                     text=True)
                 if self.sudo_pw:
-                    proc.stdin.write(self.sudo_pw + "\n")
+                    try:
+                        proc.stdin.write(self.sudo_pw + "\n")
+                        proc.stdin.flush()
+                    except BrokenPipeError:
+                        proc.terminate()
+                        proc.wait(timeout=10)
+                        out.close()
+                        err.close()
+                        raise EnvironmentDrift(
+                            "bpftrace exited before accepting the sudo "
+                            "password")
                 proc.stdin.close()
-                time.sleep(1.0)
+                attach_t0 = time.monotonic()
+                attach_line = self._wait_for_attach(
+                    run_dir / "bpftrace.stderr.txt", proc, timeout=10.0)
+                attach_s = round(time.monotonic() - attach_t0, 3)
+                if not attach_line:
+                    proc.terminate()
+                    proc.wait(timeout=10)
+                    out.close()
+                    err.close()
+                    raise EnvironmentDrift(
+                        "bpftrace did not confirm probe attach; refusing "
+                        "to run fio outside a confirmed trace window")
                 rec = self.run_with_retry(
                     run_id, job_text=job, own_bpf=True,
                     expect_backend=engine_specs()[engine][1] or None,
-                    extra={"bpf_script": script.name})
+                    extra={"bpf_script": script.name,
+                           "bpf_attach": attach_line,
+                           "bpf_attach_s": attach_s,
+                           "bpf_window_s": window_s})
                 try:
-                    proc.wait(timeout=40)
+                    proc.wait(timeout=window_s + 30)
                 except subprocess.TimeoutExpired:
                     proc.terminate()
                     proc.wait(timeout=10)
                 out.close()
                 err.close()
+                # The bpftrace window belongs to the first attempt. If the
+                # accepted run is a retry, its fio execution happened outside
+                # (or after) that window; never copy the first attempt's
+                # counters into the retry directory (audit R1-1, corrected).
+                accepted = self.accepted_run_dir(rec)
+                retry_outside_window = accepted != run_dir
+                if retry_outside_window:
+                    accepted.mkdir(parents=True, exist_ok=True)
+                    source = self._bpf_source_dir(run_dir)
+                    src = source / "bpf-counts.bt"
+                    if src.exists():
+                        shutil.copy2(src, accepted / src.name)
+                    (accepted / "bpf-scope.json").write_text(
+                        json.dumps({
+                            "trace_attempt": run_dir.name,
+                            "accepted_attempt": accepted.name,
+                            "counts_attributable": False,
+                            "reason": "accepted fio run is a retry outside "
+                                      "the traced attempt",
+                        }, indent=2, sort_keys=True) + "\n")
+                # Completion receipt: attach line, window, attach latency and
+                # exit code. The report refuses EBPF_COUNTED when the window
+                # does not cover attach + fio wall time.
+                meta_path = accepted / "meta.json"
+                if meta_path.exists():
+                    meta = json.loads(meta_path.read_text())
+                    meta["bpf_attach"] = attach_line
+                    meta["bpf_window_s"] = window_s
+                    meta["bpf_attach_s"] = attach_s
+                    meta["bpf_retry_outside_window"] = retry_outside_window
+                    meta["bpftrace_returncode"] = proc.returncode
+                    meta_path.write_text(
+                        json.dumps(meta, indent=2, sort_keys=True) + "\n")
 
     def mode_trace(self, cells, engines) -> None:
         """strace -c syscall counting on short runs + bare controls +
@@ -746,7 +963,8 @@ interval:s:14 { exit(); }
                     run_id, job_text=job, wrap=wrap,
                     expect_backend=engine_specs()[engine][1] or None)
                 if rec["status"] == "ok":
-                    (run_dir / "event-loss.json").write_text(json.dumps(
+                    accepted = self.accepted_run_dir(rec)
+                    (accepted / "event-loss.json").write_text(json.dumps(
                         {"mode": "strace-count", "loss_concept":
                          "strace -c is exhaustive for traced syscalls; "
                          "loss N/A", "bpftrace_lost_events": None},
@@ -804,7 +1022,12 @@ interval:s:14 { exit(); }
             if path.is_file() and "sha256-manifest" not in path.name:
                 rel = path.relative_to(self.root)
                 # root-owned perf artifacts may be 0600: hash via sudo as
-                # needed so the manifest is complete in root sessions
-                lines.append("%s  %s" % (self._sha256_any(path), rel))
+                # needed so the manifest is complete in root sessions.
+                # A single unreadable file must not abort the manifest.
+                try:
+                    digest = self._sha256_any(path)
+                except (RuntimeError, OSError, IndexError) as exc:
+                    digest = "UNREADABLE(%s)" % type(exc).__name__
+                lines.append("%s  %s" % (digest, rel))
         (self.root / "sha256-manifest.txt").write_text("\n".join(lines)
                                                        + "\n")

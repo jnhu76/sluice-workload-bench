@@ -11,15 +11,18 @@ import json
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 TOOLS = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(TOOLS))
 
 from attribution import (capability, parse_bpftrace, parse_perf,  # noqa: E402
                         parse_trace, report)
+import render_cost_ledger  # noqa: E402
 
 
 def write(path: pathlib.Path, text: str) -> pathlib.Path:
@@ -31,14 +34,20 @@ def write(path: pathlib.Path, text: str) -> pathlib.Path:
 def make_run(session: pathlib.Path, run_id: str, *, fio_json: str | None,
              perf_raw: str | None = None, strace_raw: str | None = None,
              engine_load: list | None = None, discarded: bool = False,
-             extra_meta: dict | None = None) -> pathlib.Path:
+             extra_meta: dict | None = None,
+             job_text: str | None = None,
+             wall_s: float | None = None) -> pathlib.Path:
     d = session / "runs" / run_id
     d.mkdir(parents=True, exist_ok=True)
     meta = {"run_id": run_id, "status": "ok", "engine_load": engine_load,
             "discarded": discarded}
+    if wall_s is not None:
+        meta["wall_s"] = wall_s
     if extra_meta:
         meta.update(extra_meta)
     write(d / "meta.json", json.dumps(meta))
+    if job_text is not None:
+        write(d / "fio-job.fio", job_text)
     if fio_json is not None:
         write(d / "fio-result.json", fio_json)
     if perf_raw is not None:
@@ -88,7 +97,8 @@ class TestParsePerf(unittest.TestCase):
         self.assertIsNone(events["cycles:k"]["value"])
         row = report.per_op_row(
             {"metrics": {"lifecycle_ios": 1000},
-             "perf": events, "run_id": "A1__io_uring__pmu__rep1"},
+             "perf": events, "run_id": "A1__io_uring__pmu__rep1",
+             "job_text": "ramp_time=0\n"},
             "process_lifecycle")
         # kernel cycles must NOT appear as a numeric per-op value anywhere
         for label in row["values"]:
@@ -100,7 +110,8 @@ class TestParsePerf(unittest.TestCase):
         self.assertEqual(events["cycles:u"]["kind"], "scaled")
         row = report.per_op_row(
             {"metrics": {"lifecycle_ios": 1000},
-             "perf": events, "run_id": "A1__io_uring__pmu__rep1"},
+             "perf": events, "run_id": "A1__io_uring__pmu__rep1",
+             "job_text": "ramp_time=0\n"},
             "process_lifecycle")
         cyc = row["values"]["PROCESS_LIFECYCLE_CYCLES_per_op"]
         self.assertEqual(cyc["class"], "SCALED")
@@ -120,7 +131,8 @@ class TestDenominator(unittest.TestCase):
         # io_bytes=0 -> no denominator -> per-op computation refused
         run = {"metrics": {"lifecycle_ios": None}, "perf":
                parse_perf.parse_perf_stat_csv(MAIN_PERF_OK),
-               "run_id": "A1__io_uring__pmu__rep1"}
+               "run_id": "A1__io_uring__pmu__rep1",
+               "job_text": "ramp_time=0\n"}
         row = report.per_op_row(run, "process_lifecycle")
         self.assertEqual(row["status"], "REFUSED")
         self.assertIsNone(row["denominator"])
@@ -204,7 +216,9 @@ def build_session(tmp: pathlib.Path, variant: str = "ok") -> pathlib.Path:
     session.mkdir()
     rev = "5d94f233967c3aef993eb19ba9e3252c532b0951"
     write(session / "binary-manifest.json", json.dumps(
-        {"sluice_revision": rev}))
+        {"sluice_revision": rev,
+         "engines": {"sluice-uring": {"text_section_match": True}},
+         "fio_diag": {"sha256": "fixture"}}))
     load = [rev, "ring", "fio-3.40", "uring", "16", "4"]
     ios = 4096 * 1000
     # clean: two engines x 2 reps + a psync row
@@ -222,20 +236,21 @@ def build_session(tmp: pathlib.Path, variant: str = "ok") -> pathlib.Path:
     pmu_ios = 4096 * 1000
     make_run(session, "A1__io_uring__pmu__rep1",
              fio_json=fio_doc(pmu_ios, iops=600000.0),
-             perf_raw=MAIN_PERF_OK, engine_load=None)
+             perf_raw=MAIN_PERF_OK, engine_load=None,
+             job_text="[job]\nramp_time=0\n")
     make_run(session, "A1__sluice-uring__pmu__rep1",
              fio_json=fio_doc(pmu_ios, iops=420000.0),
              perf_raw="7440000,,instructions:u,1,100.00,,\n"
                       "12040000,,cycles:u,1,100.00,,\n"
                       "1881.0,msec,task-clock:u,1,100.00,,\n",
-             engine_load=load)
+             engine_load=load, job_text="[job]\nramp_time=0\n")
     # crosscheck C2
     make_run(session, "C2__io_uring__pmu__rep1",
              fio_json=fio_doc(pmu_ios, iops=600000.0),
              perf_raw="1490000,,instructions:u,1,100.00,,\n"
                       "2410000,,cycles:u,1,100.00,,\n"
                       "941.0,msec,task-clock:u,1,100.00,,\n",
-             engine_load=None)
+             engine_load=None, job_text="[job]\nramp_time=0\n")
     # record run (SAMPLED)
     d = make_run(session, "A1__sluice-uring__record__rep1",
                  fio_json=fio_doc(ios), engine_load=load)
@@ -361,7 +376,13 @@ class TestRootSession(unittest.TestCase):
         summary = parse_bpftrace.summarize(maps, 1000)
         self.assertEqual(summary["per_op"]["enters"], 1.0)
         self.assertEqual(summary["per_op"]["punts"], 0.998)
-        self.assertEqual(summary["per_op"]["cqe_events"], 1.0)
+        # cqe is comm-filtered: the worker's 600 completions are not this
+        # run's completions (host-aggregate evidence, not per-process).
+        self.assertEqual(summary["counts"]["cqe_events"], 400)
+        self.assertEqual(summary["per_op"]["cqe_events"], 0.4)
+        self.assertEqual(
+            summary["counts"]["cqe_events_non_fio_comms_system_wide"], 600)
+        self.assertEqual(summary["scope"], "HOST_ISOLATED_AGGREGATE")
         self.assertEqual(summary["fio_dwell_us_per_op"], 5000.0)
         self.assertEqual(summary["dwell_ms"]["fio"], 5000.0)
 
@@ -399,6 +420,7 @@ class TestRootSession(unittest.TestCase):
         run = {"run_id": "A1__io_uring__pmu-root-g2__rep1",
                "metrics": {"lifecycle_ios": 1000,
                            "directions": {"read": {"iops": 100000.0}}},
+               "job_text": "[job]\nramp_time=0\n",
                "perf": parse_perf.parse_perf_stat_csv(
                    "500000,,cycles:u,1,100.00,,\n"
                    "2500000,,cycles:k,1,100.00,,\n")}
@@ -412,6 +434,7 @@ class TestRootSession(unittest.TestCase):
         run = {"run_id": "A1__x__pmu-root-g3__rep1",
                "metrics": {"lifecycle_ios": 1000,
                            "directions": {"read": {"iops": 1.0}}},
+               "job_text": "[job]\nramp_time=0\n",
                "perf": parse_perf.parse_perf_stat_csv(
                    "<not counted>,,LLC-loads,0,0.00,,\n")}
         row = report._root_pmu_row(run)
@@ -429,12 +452,14 @@ class TestWindowContract(unittest.TestCase):
               json.dumps({"sluice_revision": "rev"}))
         ios = 4096 * 1000
         make_run(session, "A2__io_uring__pmu__rep1",
-                 fio_json=fio_doc(ios),
+                 fio_json=fio_doc(ios), wall_s=10.0,
+                 job_text="[job]\nramp_time=0\n",
                  perf_raw="10000000,,instructions:u,1,100.00,,\n"
                           "20000000,,cycles:u,1,100.00,,\n"
                           "1000.0,msec,task-clock:u,1,100.00,,\n")
         make_run(session, "C2__io_uring__pmu__rep1",
-                 fio_json=fio_doc(ios),
+                 fio_json=fio_doc(ios), wall_s=9.0,
+                 job_text="[job]\nramp_time=0\n",
                  perf_raw="9900000,,instructions:u,1,100.00,,\n"
                           "19800000,,cycles:u,1,100.00,,\n"
                           "990.0,msec,task-clock:u,1,100.00,,\n")
@@ -451,6 +476,695 @@ class TestWindowContract(unittest.TestCase):
         self.assertTrue(window["startup_share_bound_ok"])
         self.assertEqual(window["startup_share_bound_pct"],
                          native["delta_pct_of_C"])
+
+
+class TestBpfAttribution(unittest.TestCase):
+    """#639/audit C: eBPF counters are comm-keyed host aggregates."""
+
+    def test_cqe_is_comm_filtered(self):
+        raw = ("@cqe[fio]: 400\n"
+               "@cqe[iou-wrk-7]: 600\n"
+               "@cqe[node]: 5\n")
+        maps = parse_bpftrace.parse_maps(raw)
+        summary = parse_bpftrace.summarize(maps, 1000)
+        self.assertEqual(summary["counts"]["cqe_events"], 400)
+        self.assertEqual(
+            summary["counts"]["cqe_events_non_fio_comms_system_wide"], 605)
+        self.assertEqual(
+            summary["counts"]["iou_wrk_cqe_events_system_wide"], 600)
+        self.assertEqual(summary["per_op"]["cqe_events"], 0.4)
+
+    def test_foreign_comm_never_enters_run_per_op(self):
+        # A foreign io_uring application must not inflate this run's cqe/op.
+        maps = parse_bpftrace.parse_maps(
+            "@enter[fio]: 900\n@cqe[fio]: 900\n"
+            "@cqe[other-ioapp]: 50000\n")
+        summary = parse_bpftrace.summarize(maps, 1000)
+        self.assertEqual(summary["counts"]["cqe_events"], 900)
+        self.assertEqual(summary["per_op"]["cqe_events"], 0.9)
+
+    def test_system_wide_keys_never_enter_per_op(self):
+        maps = parse_bpftrace.parse_maps(
+            "@dwell[iou-wrk-7]: 3000000000\n@cqe[iou-wrk-7]: 3\n")
+        summary = parse_bpftrace.summarize(maps, 1000)
+        self.assertNotIn("iou_wrk_dwell_ns_system_wide", summary["per_op"])
+        self.assertNotIn("iou_wrk_cqe_events_system_wide", summary["per_op"])
+
+    def test_positive_count_not_silently_zero(self):
+        maps = parse_bpftrace.parse_maps(
+            "@enter[fio]: 3208449\n@punt[fio]: 1\n")
+        summary = parse_bpftrace.summarize(maps, 3208449)
+        self.assertEqual(summary["counts"]["punts"], 1)
+        self.assertEqual(summary["per_op"]["punts"], 0.0)
+        # The raw count stays visible; a rounded zero must not be the
+        # only representation of a real event.
+        self.assertIn("punts", summary["counts_nonzero_but_per_op_zero"])
+        self.assertEqual(summary["scope"], "HOST_ISOLATED_AGGREGATE")
+
+
+class TestBpfRowEvidence(unittest.TestCase):
+    def _run(self, maps, *, stderr="Attached 8 probes\n", lost=None,
+             with_bpftrace=True, run_id="A1__io_uring__trace-bpf__rep1",
+             meta=None):
+        run = {"run_id": run_id,
+               "meta": ({"bpf_window_s": 16, "wall_s": 10.0,
+                         "bpf_attach_s": 0.2} if meta is None else meta),
+               "metrics": {"lifecycle_ios": 1000,
+                           "directions": {"read": {"iops": 100.0}}}}
+        if with_bpftrace:
+            attach = ""
+            for line in stderr.splitlines():
+                if line.startswith("Attached "):
+                    attach = line.strip()
+            run["bpftrace"] = {"maps": maps, "lost_events": lost,
+                               "stderr": stderr, "attach_line": attach}
+        return run
+
+    def test_missing_receipt_is_unavailable(self):
+        row = report._bpf_row(self._run({}, with_bpftrace=False))
+        self.assertEqual(row["label"], "EBPF_UNAVAILABLE")
+        self.assertEqual(row["scope"], "UNAVAILABLE")
+        self.assertEqual(row["summary"], {})
+        self.assertIn("UNAVAILABLE", row["reliability"])
+
+    def test_empty_dump_is_unavailable(self):
+        row = report._bpf_row(self._run({}))
+        self.assertEqual(row["label"], "EBPF_UNAVAILABLE")
+        self.assertEqual(row["scope"], "UNAVAILABLE")
+
+    def test_missing_attach_receipt_is_unavailable(self):
+        maps = parse_bpftrace.parse_maps("@enter[fio]: 10\n")
+        row = report._bpf_row(self._run(maps, stderr=""))
+        self.assertEqual(row["label"], "EBPF_UNAVAILABLE")
+        self.assertIn("attach", row["reliability"].lower())
+
+    def test_counted_row_has_host_scope(self):
+        maps = parse_bpftrace.parse_maps("@enter[fio]: 10\n@cqe[fio]: 10\n")
+        row = report._bpf_row(self._run(maps))
+        self.assertEqual(row["label"], "EBPF_COUNTED")
+        self.assertEqual(row["scope"], "HOST_ISOLATED_AGGREGATE")
+        self.assertIn("not proof of zero loss", row["reliability"])
+
+    def test_window_overshoot_is_not_counted(self):
+        maps = parse_bpftrace.parse_maps("@enter[fio]: 10\n@cqe[fio]: 10\n")
+        row = report._bpf_row(self._run(
+            maps, meta={"bpf_window_s": 16, "wall_s": 15.5,
+                        "bpf_attach_s": 1.0}))
+        self.assertEqual(row["label"], "EBPF_WINDOW_OVERSHOOT")
+        self.assertIn("lower bounds", row["reliability"])
+        self.assertNotEqual(row["label"], "EBPF_COUNTED")
+
+    def test_retry_outside_window_is_unavailable(self):
+        maps = parse_bpftrace.parse_maps("@enter[fio]: 10\n@cqe[fio]: 10\n")
+        row = report._bpf_row(self._run(
+            maps, meta={"bpf_window_s": 16, "wall_s": 10.0,
+                        "bpf_attach_s": 0.2,
+                        "bpf_retry_outside_window": True}))
+        self.assertEqual(row["label"], "EBPF_UNAVAILABLE")
+        self.assertIn("retry", row["reliability"])
+
+    def test_missing_window_receipt_is_unverified(self):
+        maps = parse_bpftrace.parse_maps("@enter[fio]: 10\n@cqe[fio]: 10\n")
+        row = report._bpf_row(self._run(maps, meta={}))
+        self.assertEqual(row["label"], "EBPF_WINDOW_UNVERIFIED")
+
+    def test_missing_window_reconstructed_from_job(self):
+        maps = parse_bpftrace.parse_maps("@enter[fio]: 10\n@cqe[fio]: 10\n")
+        run = self._run(maps, meta={"wall_s": 10.0, "bpf_attach_s": 0.2})
+        run["job_text"] = "[job]\nruntime=10\nramp_time=0\n"
+        row = report._bpf_row(run)
+        self.assertEqual(row["label"], "EBPF_COUNTED")
+        self.assertEqual(row["window"]["window_s"], 14)
+        self.assertEqual(row["window"]["window_basis"],
+                         "RECONSTRUCTED_FROM_JOB")
+
+    def test_lossy_row_is_lower_bound_and_no_exact_dwell(self):
+        maps = parse_bpftrace.parse_maps(
+            "@enter[fio]: 10\n@cqe[fio]: 10\n")
+        row = report._bpf_row(self._run(maps, lost=927693))
+        self.assertEqual(row["label"], "EBPF_LOSSY")
+        self.assertIn("lower bound", row["reliability"])
+        self.assertNotIn("fio_dwell_us_per_op", row["summary"])
+        self.assertTrue(row["summary"]["dwell_invalid"])
+
+    def test_renderer_consumes_lossy_rows(self):
+        maps = parse_bpftrace.parse_maps(
+            "@enter[fio]: 10\n@cqe[fio]: 10\n")
+        row = report._bpf_row(self._run(maps, lost=7))
+        out = render_cost_ledger.render_bpf(
+            {"A1/sluice-uring": {"trace-bpf": [row]}})
+        self.assertIn("EBPF_LOSSY", out)
+        self.assertIn("lower bound", out)
+        self.assertIn("dwell INVALID", out)
+
+    def test_threadpool_io_uring_counters_are_not_applicable(self):
+        maps = parse_bpftrace.parse_maps(
+            "@futex[fio]: 100\n@dwell[fio]: 1000\n")
+        summary = parse_bpftrace.summarize(
+            maps, 100, io_uring_applicable=False)
+        self.assertIsNone(summary["counts"]["enters"])
+        self.assertNotIn("enters", summary["per_op"])
+        self.assertNotIn("cqe_events", summary["per_op"])
+        self.assertIn("enters", summary["not_applicable"])
+        self.assertEqual(summary["per_op"]["futex"], 1.0)
+        row = report._bpf_row(self._run(
+            maps, run_id="A1__sluice-threadpool__trace-bpf__rep1"))
+        self.assertEqual(row["label"], "EBPF_COUNTED")
+        self.assertIsNone(row["summary"]["counts"]["enters"])
+        self.assertNotIn("enters", row["summary"]["per_op"])
+
+    def test_maps_without_fio_keys_are_unavailable(self):
+        maps = parse_bpftrace.parse_maps(
+            "@futex[node]: 500\n@cqe[other-ioapp]: 900\n")
+        row = report._bpf_row(self._run(maps))
+        self.assertEqual(row["label"], "EBPF_UNAVAILABLE")
+        self.assertIn("fio-keyed", row["reliability"])
+
+    def test_missing_required_io_uring_maps_are_unavailable(self):
+        maps = parse_bpftrace.parse_maps("@futex[fio]: 100\n")
+        row = report._bpf_row(self._run(
+            maps, run_id="A1__sluice-uring__trace-bpf__rep1"))
+        self.assertEqual(row["label"], "EBPF_UNAVAILABLE")
+        self.assertIn("required io_uring maps missing", row["reliability"])
+        self.assertEqual(row["scope"], "UNAVAILABLE")
+
+
+class TestWindowAndLabels(unittest.TestCase):
+    def test_per_op_refuses_nonzero_ramp(self):
+        run = {"run_id": "A1__io_uring__pmu__rep1",
+               "job_text": "[job]\nramp_time=2\n",
+               "metrics": {"lifecycle_ios": 1000},
+               "perf": parse_perf.parse_perf_stat_csv(MAIN_PERF_OK)}
+        row = report.per_op_row(run, "process_lifecycle")
+        self.assertEqual(row["status"], "REFUSED")
+        self.assertFalse(row["window_verified"])
+        self.assertIn("ramp_time", row["reason"])
+        for value in row["values"].values():
+            self.assertNotEqual(value.get("class"), "counted")
+
+    def test_per_op_refuses_missing_ramp_receipt(self):
+        run = {"run_id": "A1__io_uring__pmu__rep1",
+               "metrics": {"lifecycle_ios": 1000},
+               "perf": parse_perf.parse_perf_stat_csv(MAIN_PERF_OK)}
+        row = report.per_op_row(run, "process_lifecycle")
+        self.assertEqual(row["status"], "REFUSED")
+        self.assertFalse(row["window_verified"])
+
+    def test_ramp_zero_substring_is_not_matched(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = tmp / "session-ramp-substring"
+        session.mkdir()
+        make_run(session, "A1__io_uring__clean0__rep1",
+                 fio_json=fio_doc(4096 * 1000),
+                 job_text="[job]\nramp_time=0.5\n",
+                 extra_meta={"rusage": {"cpu_user_s": 1.0,
+                                        "cpu_sys_s": 0.5,
+                                        "ctx_voluntary": 10,
+                                        "ctx_involuntary": 2}})
+        analysis = report.analyze_session(session)
+        clean0 = analysis["normalized"]["A1/io_uring"]["clean0"]
+        self.assertFalse(clean0["window_matched"])
+        self.assertNotIn("rusage_per_op", clean0)
+
+    def test_root_pmu_row_labels_and_scope(self):
+        run = {"run_id": "A1__io_uring__pmu-root-g2__rep1",
+               "job_text": "[job]\nramp_time=0\n",
+               "metrics": {"lifecycle_ios": 1000,
+                           "directions": {"read": {"iops": 1.0}}},
+               "perf": parse_perf.parse_perf_stat_csv(
+                   "500000,,cycles:u,1,100.00,,\n"
+                   "2500000,,cycles:k,1,100.00,,\n")}
+        row = report._root_pmu_row(run)
+        self.assertEqual(row["denominator_kind"], "lifecycle_ios")
+        self.assertIn("PROCESS_LIFECYCLE", row["label"])
+        self.assertIn("user+sys", row["scope_note"])
+        self.assertTrue(row["window_verified"])
+
+    def test_root_pmu_row_refuses_nonzero_ramp(self):
+        run = {"run_id": "A1__io_uring__pmu-root-g2__rep1",
+               "job_text": "[job]\nramp_time=2\n",
+               "metrics": {"lifecycle_ios": 1000,
+                           "directions": {"read": {"iops": 1.0}}},
+               "perf": parse_perf.parse_perf_stat_csv(
+                   "500000,,cycles:u,1,100.00,,\n")}
+        row = report._root_pmu_row(run)
+        self.assertEqual(row["status"], "REFUSED")
+        self.assertIn("ramp_time", row["reason"])
+
+    def test_aux_row_status_ok_when_aux_counted(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = tmp / "session-aux"
+        session.mkdir()
+        make_run(session, "A1__io_uring__pmu-aux1__rep1",
+                 fio_json=fio_doc(4096 * 1000),
+                 job_text="[job]\nramp_time=0\n",
+                 perf_raw="500000,,branches:u,1,100.00,,\n")
+        analysis = report.analyze_session(session)
+        row = analysis["normalized"]["A1/io_uring"]["pmu-aux1"][0]
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["main_status"], "REFUSED")
+        self.assertEqual(row["aux_events"]["branches:u"]["class"], "counted")
+
+    def test_per_op_class_only_native_within_gate(self):
+        self.assertEqual(report._per_op_class("io_uring", 1.01),
+                         "lifecycle_primary")
+        self.assertEqual(report._per_op_class("io_uring", 10.01),
+                         "lifecycle_only")
+        self.assertEqual(report._per_op_class("sluice-uring", 7.408),
+                         "lifecycle_only")
+        self.assertEqual(report._per_op_class("sluice-threadpool", 4.143),
+                         "lifecycle_only")
+
+
+class TestLedgerRenderer(unittest.TestCase):
+    def _session(self, tmp: pathlib.Path) -> pathlib.Path:
+        session = tmp / "session-render"
+        (session / "analysis").mkdir(parents=True)
+        norm = {"A1/io_uring": {
+            "cell": "A1", "engine": "io_uring",
+            "pmu": [{"status": "ok", "denominator": 1000,
+                     "values": {
+                         "PROCESS_LIFECYCLE_INSTRUCTIONS_per_op":
+                             {"value": 2000.0, "class": "counted"},
+                         "PROCESS_LIFECYCLE_CYCLES_per_op":
+                             {"value": 1000.0, "class": "counted"},
+                         "PROCESS_LIFECYCLE_CPU_TIME_us_per_op":
+                             {"value": 1.5, "class": "counted"}}}]}}
+        (session / "analysis" / "normalized-costs.json").write_text(
+            json.dumps(norm))
+        (session / "analysis" / "window-contract.json").write_text(
+            json.dumps({"per_engine": {}, "verdict": "X"}))
+        return session
+
+    def test_fill_ledger_replaces_marked_sections(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = self._session(tmp)
+        ledger = tmp / "LEDGER.md"
+        ledger.write_text(
+            "intro\n<!-- LEDGER-DATA:BEGIN -->\nold\n"
+            "<!-- LEDGER-DATA:END -->\n"
+            "<!-- TRACE-DATA:BEGIN -->\nold\n<!-- TRACE-DATA:END -->\n"
+            "<!-- PERTURBATION:BEGIN -->\nold\n<!-- PERTURBATION:END -->\n"
+            "tail\n")
+        render_cost_ledger.fill_ledger(session, ledger)
+        text = ledger.read_text()
+        self.assertIn("| A1 | io_uring | 1 |", text)
+        self.assertNotIn("\nold\n", text)
+        self.assertIn("intro", text)
+        self.assertIn("tail", text)
+
+    def test_fill_ledger_errors_without_markers(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = self._session(tmp)
+        ledger = tmp / "LEDGER.md"
+        ledger.write_text("no markers here\n")
+        with self.assertRaises(SystemExit):
+            render_cost_ledger.fill_ledger(session, ledger)
+
+    def test_render_h_reads_per_engine_delta(self):
+        out = render_cost_ledger.render_h(
+            {}, {"verdict": "V",
+                 "per_engine": {"io_uring": {"delta_pct_of_C": 1.009}}})
+        self.assertIn("1.009", out)
+        self.assertNotIn("None", out)
+
+
+class TestShaGate(unittest.TestCase):
+    def test_record_run_without_manifest_fails_closed(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = tmp / "session-nomanifest"
+        (session / "runs").mkdir(parents=True)
+        make_run(session, "A1__sluice-uring__record__rep1",
+                 fio_json=fio_doc(4096 * 1000))
+        analysis = report.analyze_session(session)
+        self.assertFalse(analysis["sha_mismatch_free"])
+        self.assertFalse(analysis["binary_manifest"]["present"])
+
+    def test_record_manifest_without_engine_proof_fails_closed(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = tmp / "session-noproof"
+        (session / "runs").mkdir(parents=True)
+        rev = "5d94f233967c3aef993eb19ba9e3252c532b0951"
+        write(session / "binary-manifest.json", json.dumps(
+            {"sluice_revision": rev, "engines": {},
+             "fio_diag": {"sha256": "x"}}))
+        make_run(session, "A1__sluice-uring__record__rep1",
+                 fio_json=fio_doc(4096 * 1000),
+                 engine_load=[rev, "ring", "fio-3.40", "uring", "16", "4"])
+        analysis = report.analyze_session(session)
+        self.assertFalse(analysis["sha_mismatch_free"])
+        self.assertEqual(analysis["binary_manifest"]["gate"],
+                         "TEXT_SECTION_MISMATCH")
+        self.assertIn("sluice-uring", analysis["sha_mismatch_text"])
+
+    def test_record_run_without_engine_load_fails_closed(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = tmp / "session-noload"
+        (session / "runs").mkdir(parents=True)
+        rev = "5d94f233967c3aef993eb19ba9e3252c532b0951"
+        write(session / "binary-manifest.json", json.dumps({
+            "sluice_revision": rev,
+            "engines": {"sluice-uring": {"text_section_match": True}},
+            "fio_diag": {"sha256": "x"}}))
+        make_run(session, "A1__sluice-uring__record__rep1",
+                 fio_json=fio_doc(4096 * 1000), engine_load=None)
+        analysis = report.analyze_session(session)
+        self.assertFalse(analysis["sha_mismatch_free"])
+        self.assertEqual(analysis["binary_manifest"]["gate"],
+                         "ENGINE_LOAD_MISSING")
+        self.assertEqual(analysis["sha_mismatch_provenance"],
+                         ["A1__sluice-uring__record__rep1"])
+
+    def test_text_section_mismatch_fails_closed(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = tmp / "session-textmismatch"
+        (session / "runs").mkdir(parents=True)
+        rev = "5d94f233967c3aef993eb19ba9e3252c532b0951"
+        write(session / "binary-manifest.json", json.dumps({
+            "sluice_revision": rev,
+            "engines": {"sluice-uring": {"text_section_match": False}},
+            "fio_diag": {"sha256": "x"}}))
+        make_run(session, "A1__sluice-uring__record__rep1",
+                 fio_json=fio_doc(4096 * 1000),
+                 engine_load=[rev, "ring", "fio-3.40", "uring", "16", "4"])
+        analysis = report.analyze_session(session)
+        self.assertFalse(analysis["sha_mismatch_free"])
+        self.assertIn("sluice-uring", analysis["sha_mismatch_text"])
+
+
+class TestRunnerRepairs(unittest.TestCase):
+    def test_retry_wrap_paths_retargeted(self):
+        import sys as _sys
+        _sys.path.insert(0, str(TOOLS))
+        from attribution import runner
+        attempt = "A1__io_uring__record__rep1"
+        retry = attempt + "r"
+        kwargs = {"wrap": ["perf", "record", "-o",
+                           "/base/runs/%s/perf.data" % attempt, "--"],
+                  "job_text": "x"}
+        out = runner.Session._retarget_wrap(kwargs, attempt, retry)
+        self.assertIn("/base/runs/%s/perf.data" % retry,
+                      " ".join(out["wrap"]))
+        self.assertIn("/base/runs/%s/perf.data" % attempt,
+                      " ".join(kwargs["wrap"]))
+
+    def test_attach_barrier_reads_receipt(self):
+        import sys as _sys
+        _sys.path.insert(0, str(TOOLS))
+        from attribution import runner
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        err = tmp / "err.txt"
+        err.write_text("Attached 8 probes\n")
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        line = runner.Session._wait_for_attach(err, proc, timeout=1.0)
+        self.assertEqual(line, "Attached 8 probes")
+
+    def test_attach_barrier_times_out_without_receipt(self):
+        import sys as _sys
+        _sys.path.insert(0, str(TOOLS))
+        from attribution import runner
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        err = tmp / "err.txt"
+        err.write_text("no attach line\n")
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        line = runner.Session._wait_for_attach(err, proc, timeout=0.2)
+        self.assertEqual(line, "")
+
+    def test_mode_record_postprocess_uses_retry_dir(self):
+        import sys as _sys
+        _sys.path.insert(0, str(TOOLS))
+        from attribution import runner
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = runner.Session(tmp / "results", tmp / "scratch")
+        session.prep_file = lambda label, size: tmp / "dummy.bin"
+        attempt = "A1__io_uring__record__rep1"
+        retry = attempt + "r"
+
+        def fake_retry(run_id, **kwargs):
+            rd = session.runs_dir / retry
+            rd.mkdir(parents=True, exist_ok=True)
+            (rd / "perf.data").write_bytes(b"perfdata")
+            (rd / "meta.json").write_text(json.dumps(
+                {"run_id": retry, "status": "ok"}))
+            return {"run_id": retry, "status": "ok", "failures": []}
+
+        def fake_run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, "report", "")
+
+        session.run_with_retry = fake_retry
+        with mock.patch.object(runner.subprocess, "run",
+                               side_effect=fake_run) as run_patch:
+            session.mode_record(["A1"], ["io_uring"])
+        accepted = session.runs_dir / retry
+        for name in ("perf-header.txt", "perf-report.txt",
+                     "perf-report-flat.txt", "perf.data.sha256"):
+            self.assertTrue((accepted / name).exists(), name)
+        self.assertFalse(
+            (session.runs_dir / attempt / "perf-report.txt").exists())
+        for call in run_patch.call_args_list:
+            argv = call.args[0]
+            if "-i" in argv:
+                self.assertIn(retry, argv[argv.index("-i") + 1])
+
+    def test_mode_trace_bpf_retry_marks_outside_window(self):
+        import sys as _sys
+        _sys.path.insert(0, str(TOOLS))
+        from attribution import runner
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = runner.Session(tmp / "results", tmp / "scratch",
+                                 sudo_pw="TEST_SENTINEL_NOT_A_SECRET")
+        session.prep_file = lambda label, size: tmp / "dummy.bin"
+        attempt = "A1__io_uring__trace-bpf__rep1"
+        retry = attempt + "r"
+
+        def fake_retry(run_id, **kwargs):
+            # Simulate run_fio re-using a previously failed run_id: the
+            # first attempt directory (with the live bpftrace files) is
+            # renamed to -failed before the retry directory is created.
+            attempt_dir = session.runs_dir / attempt
+            if attempt_dir.exists():
+                attempt_dir.rename(session.runs_dir / (attempt + "-failed"))
+            rd = session.runs_dir / retry
+            rd.mkdir(parents=True, exist_ok=True)
+            (rd / "meta.json").write_text(json.dumps(
+                {"run_id": retry, "status": "ok"}))
+            return {"run_id": retry, "status": "ok", "failures": []}
+
+        proc = mock.Mock()
+        proc.returncode = 0
+        proc.wait.return_value = 0
+        session.run_with_retry = fake_retry
+        with mock.patch.object(runner.subprocess, "Popen",
+                               return_value=proc), \
+                mock.patch.object(runner.Session, "_wait_for_attach",
+                                  return_value="Attached 8 probes"):
+            session.mode_trace_bpf(["A1"], ["io_uring"])
+        accepted = session.runs_dir / retry
+        failed = session.runs_dir / (attempt + "-failed")
+        self.assertTrue((failed / "bpftrace.stdout.txt").exists())
+        self.assertTrue((failed / "bpftrace.stderr.txt").exists())
+        self.assertTrue((accepted / "bpf-counts.bt").exists())
+        self.assertFalse((accepted / "bpftrace.stdout.txt").exists())
+        self.assertFalse((accepted / "bpftrace.stderr.txt").exists())
+        scope = json.loads((accepted / "bpf-scope.json").read_text())
+        self.assertFalse(scope["counts_attributable"])
+        self.assertEqual(scope["trace_attempt"], attempt)
+        meta = json.loads((accepted / "meta.json").read_text())
+        self.assertEqual(meta["bpf_attach"], "Attached 8 probes")
+        self.assertEqual(meta["bpftrace_returncode"], 0)
+        self.assertGreater(meta["bpf_window_s"], 0)
+        self.assertGreaterEqual(meta["bpf_attach_s"], 0)
+        self.assertTrue(meta["bpf_retry_outside_window"])
+
+    def test_mode_record_root_reports_follow_retry_dir(self):
+        import sys as _sys
+        _sys.path.insert(0, str(TOOLS))
+        from attribution import runner
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = runner.Session(tmp / "results", tmp / "scratch",
+                                 sudo_pw="TEST_SENTINEL_NOT_A_SECRET")
+        session.prep_file = lambda label, size: tmp / "dummy.bin"
+
+        def fake_retry(run_id, **kwargs):
+            rd = session.runs_dir / (run_id + "r")
+            rd.mkdir(parents=True, exist_ok=True)
+            (rd / "perf.data").write_bytes(b"perfdata")
+            (rd / "meta.json").write_text(json.dumps(
+                {"run_id": run_id + "r", "status": "ok"}))
+            return {"run_id": run_id + "r", "status": "ok",
+                    "failures": []}
+
+        reported = []
+        session.run_with_retry = fake_retry
+        session._perf_reports = (
+            lambda run_dir, prefix, callgraph:
+            reported.append(pathlib.Path(run_dir)))
+        session.mode_record_root(["A1"], ["io_uring"],
+                                 kernel_cycles=True)
+        self.assertEqual(reported, [
+            session.runs_dir / "A1__io_uring__record-root__rep1r",
+            session.runs_dir / "A1__io_uring__record-root-k__rep1r"])
+
+    def test_mode_trace_event_loss_follows_retry_dir(self):
+        import sys as _sys
+        _sys.path.insert(0, str(TOOLS))
+        from attribution import runner
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = runner.Session(tmp / "results", tmp / "scratch")
+        session.prep_file = lambda label, size: tmp / "dummy.bin"
+
+        def fake_retry(run_id, **kwargs):
+            rd = session.runs_dir / (run_id + "r")
+            rd.mkdir(parents=True, exist_ok=True)
+            (rd / "meta.json").write_text(json.dumps(
+                {"run_id": run_id + "r", "status": "ok"}))
+            return {"run_id": run_id + "r", "status": "ok",
+                    "failures": []}
+
+        session.run_with_retry = fake_retry
+        session.mode_trace(["A1"], ["io_uring"])
+        accepted = (session.runs_dir /
+                    "A1__io_uring__trace-straced__rep1r")
+        self.assertTrue((accepted / "event-loss.json").exists())
+        self.assertFalse(
+            (session.runs_dir / "A1__io_uring__trace-straced__rep1" /
+             "event-loss.json").exists())
+
+
+class TestCapabilityScopes(unittest.TestCase):
+    def test_verdict_name_and_scope_lists(self):
+        matrix = capability.probe_all(env={"PATH": "/nonexistent"})
+        self.assertIn("cpu_accounting_scopes", matrix)
+        self.assertIn("cpu_accounting_verdict", matrix)
+        scopes = matrix["cpu_accounting_scopes"]
+        self.assertIn("not_measured", scopes)
+        self.assertIn("io-wq/kworker CPU attributed to this run",
+                      scopes["not_measured"])
+        self.assertIn("IRQ/softirq system cost", scopes["not_measured"])
+
+    def test_probe_perf_event_uses_sudo_password_via_stdin(self):
+        calls = []
+
+        def fake_run(argv, timeout=20.0, env=None, input_text=None):
+            calls.append({"argv": argv, "input_text": input_text})
+            return {"argv": argv, "returncode": 0,
+                    "stdout": "1,,cycles:k,1,100.00,,\n", "stderr": ""}
+
+        sentinel = "TEST_SENTINEL_NOT_A_SECRET"
+        with mock.patch.object(capability, "_which",
+                               return_value="/usr/bin/perf"), \
+                mock.patch.object(capability, "_run", side_effect=fake_run):
+            row = capability.probe_perf_event("cycles:k", sudo_pw=sentinel)
+        self.assertEqual(row["status"], "SUPPORTED")
+        self.assertTrue(any(c["argv"][:3] == ["sudo", "-S", "-p"]
+                            for c in calls))
+        for call in calls:
+            self.assertNotIn(sentinel, " ".join(call["argv"]))
+        self.assertTrue(any(c["input_text"] == sentinel + "\n"
+                            for c in calls))
+
+    def test_probe_perf_record_uses_sudo_password_via_stdin(self):
+        calls = []
+
+        def fake_run(argv, timeout=20.0, env=None, input_text=None):
+            calls.append({"argv": argv, "input_text": input_text})
+            if "-o" in argv:
+                pathlib.Path(argv[argv.index("-o") + 1]).write_bytes(b"x")
+            return {"argv": argv, "returncode": 0,
+                    "stdout": "true\n", "stderr": ""}
+
+        sentinel = "TEST_SENTINEL_NOT_A_SECRET"
+        with mock.patch.object(capability, "_which",
+                               return_value="/usr/bin/perf"), \
+                mock.patch.object(capability, "_run", side_effect=fake_run):
+            row = capability.probe_perf_record(sudo_pw=sentinel)
+        self.assertEqual(row["status"], "SUPPORTED")
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(call["argv"][:4], ["sudo", "-S", "-p", ""])
+            self.assertNotIn(sentinel, " ".join(call["argv"]))
+            self.assertEqual(call["input_text"], sentinel + "\n")
+
+
+class TestWindowContractRepairs(unittest.TestCase):
+    def test_root_pmu_modes_count_as_option_b(self):
+        cells = {("A1", "sluice-uring"):
+                 {"modes": {"pmu-root-g1": [], "pmu-root-g2": []}}}
+        window = report._window_contract(cells)
+        self.assertEqual(window["option_B"], "present")
+        self.assertEqual(window["option_C"], "absent")
+        self.assertEqual(window["option_C_kind"], "ABSENT")
+        self.assertEqual(window["verdict"],
+                         "LIFECYCLE_ONLY_NO_STEADY_STATE_EXTRAPOLATION")
+        self.assertIn("reason", window)
+
+    def test_direction_opposite_is_not_startup_proof(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = tmp / "session-direction"
+        (session / "runs").mkdir(parents=True)
+        ios = 4096 * 1000
+        make_run(session, "A2__io_uring__pmu__rep1",
+                 fio_json=fio_doc(ios), wall_s=10.0,
+                 job_text="[job]\nramp_time=0\n",
+                 perf_raw="10000000,,instructions:u,1,100.00,,\n")
+        # C2 is SHORTER yet has a LOWER per-op count: the opposite of what
+        # startup amortization predicts.
+        make_run(session, "C2__io_uring__pmu__rep1",
+                 fio_json=fio_doc(ios), wall_s=8.5,
+                 job_text="[job]\nramp_time=0\n",
+                 perf_raw="9900000,,instructions:u,1,100.00,,\n")
+        cells = {}
+        for run_dir in sorted((session / "runs").iterdir()):
+            run = report.load_run(run_dir)
+            parts = report.split_run_id(run["run_id"])
+            cells.setdefault((parts["cell"], parts["engine"]), {}) \
+                .setdefault("modes", {}).setdefault(
+                    parts["mode"], []).append(run)
+        window = report._window_contract(cells)
+        native = window["per_engine"]["io_uring"]
+        self.assertEqual(native["direction_vs_startup"], "OPPOSITE")
+        self.assertEqual(native["cross_mode_mechanism"],
+                         "MODE_OR_TIMING_EFFECT_NOT_IDENTIFIED")
+        self.assertEqual(native["cross_mode_uncertainty_pct"],
+                         native["delta_pct_of_C"])
+        self.assertEqual(window["startup_share_bound_scope"],
+                         "NATIVE_TOTAL_CROSS_MODE_DIFF_UPPER_BOUND")
+        self.assertIn("not", window["note"].lower())
+
+
+class TestAnalyzeEbpfRows(unittest.TestCase):
+    def test_analysis_exposes_ebpf_row_classes(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        session = tmp / "session-ebpf"
+        (session / "runs").mkdir(parents=True)
+        d = make_run(session, "A1__sluice-uring__trace-bpf__rep1",
+                     fio_json=fio_doc(4096 * 1000))
+        write(d / "bpftrace.stdout.txt",
+              "@enter[fio]: 1000\n@cqe[fio]: 1000\n")
+        write(d / "bpftrace.stderr.txt",
+              "Attached 8 probes\nLost 5 events\n")
+        analysis = report.analyze_session(session)
+        self.assertEqual(analysis["ebpf"]["lossy_runs"],
+                         ["A1__sluice-uring__trace-bpf__rep1"])
+        self.assertEqual(analysis["ebpf"]["counted_runs"], [])
 
 
 if __name__ == "__main__":
