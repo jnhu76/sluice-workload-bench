@@ -333,7 +333,8 @@ punt/cqe/futex）、dwarf 调用栈与内核栈。关键热点获得限定范围
 因果；本判词不构成 whole-system 全成本结论，也不是"CPU 账本完整"的证明。
 
 - **工具交付**：`tools/profile_fio_sluice.py` + `tools/attribution/`（probe/
-  clean/clean0/pmu/record/trace/crosscheck/analyze，薄编排层）+ 64 项测试
+  clean/clean0/pmu/record/trace/crosscheck/analyze，薄编排层）+ 70 项测试
+  （64 项 r3 基线 + 6 项本轮审计修复）
   （其中 12 项强制用例）；证据树可整树复算、哈希可独立校验。
 - **产品决策**：零产品结论。未触碰 #604 G0、#595（KEEP_IMMEDIATE）、
   #617、#621、#623；未修改 Sluice/fio 语义。热点账本仅作为 #639 的
