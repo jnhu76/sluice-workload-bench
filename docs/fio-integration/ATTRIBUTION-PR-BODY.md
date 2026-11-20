@@ -164,6 +164,26 @@ session-002-root 74 个、13 个排除）。原始 perf.data 未入 git（sessio
 侧车，缺失本地树时只能重跑对应会话（root 数据需 sudo）复现。无 sudo
 口令或秘密。
 
+## Closeout verification（验证对象：代码提交 `5e4fd0e`；后续仅文档计数变更）
+
+- `python3 -m unittest discover -s tools/attribution/tests`: **Ran 70 tests
+  ... OK**（64 项 r3 基线 + 6 项审计修复）。
+- `analyze --results-dir results/attribution/session-001` 与
+  `session-002-root`: **exit 0**；`sha_mismatch_free=True`；
+  `session-002-root` 74 runs / 13 排除。
+- `render_cost_ledger.py results/attribution/session-001`: 连续两次
+  sha256 相同；`git diff --exit-code -- docs/fio-integration/COST-LEDGER.md`
+  clean。
+- `bash adapters/fio/tests/smoke.sh build/scratch-smoke-pr5`: **PASS**
+  （专用 scratch，避免 `build/scratch` 旧产物触发 leftover 守卫）。
+- `xmake check-ring`: **PASS**；`run_fio_matrix.py --rehearsal`: **exit 0**。
+- root smoke `probe` / `pmu-root` / `record-root` / `trace-bpf` / `analyze`:
+  **exit 0**；`cpu_accounting_verdict=FULL_FOR_MEASURED_SCOPES`；
+  `callgraph_dwarf=True`；trace-bpf meta `bpf_window_s=9` /
+  `wall_s=3.396` / `bpf_attach_s=0.604` /
+  `bpf_retry_outside_window=false`；分析行 `EBPF_COUNTED`
+  （`window_basis=META`）。
+
 ## 未覆盖范围与重开条件
 
 - 内核态/ io-wq / eBPF 归因：root 会话（session-002-root）已完成
