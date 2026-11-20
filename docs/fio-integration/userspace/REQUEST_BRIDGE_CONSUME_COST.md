@@ -33,7 +33,7 @@
 
 pending 也走完整路径：一次 `resolve_` 扫描 + 一次 core 锁 + `published` 判定失败后返回（`request_core.cpp:329-331`）。它**不**拷 outcome、**不**清 `binding_live`、**不**回收。所以 pending 的 consume 成本 ≈“锁 + 几次比较”，比 ready 的 consume 便宜；用调用数比例去分摊 self（`REQUEST_SCOPE_LOOKUP_COST.md` §4.1）是**近似**，不是分解。
 
-> 因此把 take+consume self 按调用数比例分摊给 pending（`REQUEST_SCOPE_LOOKUP_COST.md` §4.1 的 600.2）会**高估** pending 的真实 self；该项的 pair 口径模型值为 **1,086.5–1,106.1 cyc/op（约 1,087–1,106；23.9–24.3%，INFERRED）**，不是可省净收益；早期 `[243,853]` 区间已因单位错误撤回。
+> 因此把 take+consume self 按调用数比例分摊给 pending（`REQUEST_SCOPE_LOOKUP_COST.md` §4.1 的 600.2）会**高估** pending 的真实 self；该项的 pair 口径模型值为 **1,086.5–1,106.1 cyc/op（约 1,087–1,106；23.9–24.3%，INFERRED）**，不是可省净收益；两个未验证假设是 pending 与 ready 平均 self 相同、pending core 锁与全部 libc 锁平均价相同；早期 `[243,853]` 区间已因单位错误撤回。
 
 ## 3. 为什么这把锁不能删（`SEMANTICALLY_NECESSARY_UNDER_CURRENT_DESIGN`）
 
