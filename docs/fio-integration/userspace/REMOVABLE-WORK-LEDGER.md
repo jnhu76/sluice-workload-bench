@@ -81,7 +81,7 @@
 | 项 | 内容 |
 |---|---|
 | 状态 | **NO_GO** |
-| 证据 | 增量由 take 调用次数 2→9.5 驱动；单次 take 不随长度上升；D4 全链差 < D1 |
+| 证据 | 增量由 take 调用次数 2→9.5 驱动；单次 take 不随 `resolve` 迭代上升；D4 全链差 < D1 |
 | 备注 | 现有证据不支持（**非单因素证伪**；三个 record root 各 n=1、跨会话，不能作因果证伪；见 `USERSPACE-COST-RESEARCH.md` §J.1 与 §D.3） |
 
 ### C5 — “harvest 扫描是用户态主成本”
@@ -187,7 +187,7 @@
 | (b) | D16 record-root 的 280.3 cyc/op | 4.43% 未列符号 + 1.03% vdso + 0.70% unknown | 低于 0.2% 阈值的符号 |
 | (c) | libc mutex 的 core/fio 拆分 | 31.56% 是全部 lock 符号；core 分摊**估计** 1,108.6（非严格上界，真界 0–1,436.2） | 24.128 对 vs 18.625 对 |
 | (d) | D16 全链 +5,219 instr/+3,164 cycles 的因果拆分 | 无 native 同 build record；fio driver 增量未分离 | Sluice 相关 flat self ≈3.1k（把全部 libc mutex 计入 Sluice 的上界）与 Δ≈3.16k 接近是巧合，不是分解 |
-| (e) | D64 cycles 余量 ≈2.86–2.92k/op | 无 D64 record/BPF；缓存/queueing/内核/调度未分离 | 公式见 `USERSPACE-COST-RESEARCH.md` §H.13：+5,627.7 − (1,342.7 + 1,368.0–1,422.8) = 2,862.2–2,917.0 |
+| (e) | D64 cycles 余量 ≈2.86–2.92k/op | 无 D64 record/BPF；缓存/queueing/内核/调度未分离 | 公式见 `USERSPACE-COST-RESEARCH.md` §H.13：+5,627.7 − (1,342.7 + 1,367.8–1,422.8) = 2,862.2–2,917.3 |
 | (f) | TP 的 cycles/CPU 不随指令解释 | 跨线程 handoff/调度/停顿未识别 | D16 instr −1.1%、cycles +96% |
 | (g) | 启动/收尾摊销 | W-C2 7.41%/4.14%/1.01% 是模式差，不是启动成本 | `MODE_OR_TIMING_EFFECT_NOT_IDENTIFIED` |
 | (h) | A2 pmu 跨 abort/resume | rep1 04:38、rep2 04:43、ABORT 04:39:52；IOPS 361,971→381,925、CPU 2.818→2.673 µs | instr 计数不受影响 |

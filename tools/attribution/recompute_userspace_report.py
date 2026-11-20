@@ -216,6 +216,9 @@ def table_lock_units(root):
     print("\n== E3 BPF lock units: calls/op == 2 * pairs/op ==")
     summary = load_json(os.path.join(root, E3, "analysis", "summary.json"))
     rows = summary.get("bpf_locks", [])
+    if not rows:
+        print("  no bpf_locks rows; lock unit check UNAVAILABLE")
+        return float("inf")
     worst = 0.0
     for r in rows:
         ios = r["ios"]
