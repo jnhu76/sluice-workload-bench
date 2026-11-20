@@ -92,12 +92,14 @@ def main() -> int:
                  analysis["cpu_accounting_verdict"]))
         return 0 if analysis["sha_mismatch_free"] else 1
 
-    sudo_pw = None
-    if args.mode in ("pmu-root", "record-root", "trace-bpf"):
-        sudo_pw = os.environ.get(args.sudo_password_env)
-        if not sudo_pw:
-            print("root mode requires --sudo-password-env variable to be set")
-            return 2
+    sudo_pw = os.environ.get(args.sudo_password_env)
+    if sudo_pw:
+        # The password is only piped to `sudo -S`; do not let every child
+        # (fio, perf, strace) inherit it through the environment.
+        os.environ.pop(args.sudo_password_env, None)
+    if args.mode in ("pmu-root", "record-root", "trace-bpf") and not sudo_pw:
+        print("root mode requires --sudo-password-env variable to be set")
+        return 2
     session = runner_mod.Session(
         results, scratch, cpu_set=args.cpu_set, runtime_s=args.runtime,
         ramp_s=args.ramp_time, file_size=args.file_size, fio=args.fio,

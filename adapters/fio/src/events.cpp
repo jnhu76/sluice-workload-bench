@@ -89,7 +89,14 @@ void release_slot(EngineState* state, std::size_t index) {
 // consumed (which reclaims the scope slot), the io_u error/resid fields are
 // filled before the completion is staged.
 void harvest(EngineState* state, unsigned int max) {
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+    ++state->research.harvest_calls;
+    std::uint64_t examined = 0;
+#endif
     for (std::size_t i = 0; i < state->slots.size() && state->staged.size() < max; ++i) {
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+        ++examined;
+#endif
         auto& slot = state->slots[i];
         if (slot.u == nullptr) {
             continue;
@@ -97,29 +104,59 @@ void harvest(EngineState* state, unsigned int max) {
         switch (slot.kind) {
         case EngineState::Slot::Kind::read:
         case EngineState::Slot::Kind::write: {
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+            ++state->research.take_calls;
+#endif
             auto observed = state->scope->take(slot.data);
             if (observed.readiness == sluice::async::RequestReadiness::pending) {
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+                ++state->research.take_pending;
+#endif
                 break;
             }
             if (observed.readiness == sluice::async::RequestReadiness::empty) {
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+                ++state->research.take_empty;
+#endif
                 fail_closed("getevents", "lost accepted request (ticket resolves to no slot)");
             }
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+            ++state->research.take_ready;
+#endif
             complete_data_observation(slot.u, std::move(observed.result));
             state->staged.push_back(EngineState::Completion{slot.u});
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+            state->research.note_staged(state->staged.size());
+#endif
             release_slot(state, i);
             break;
         }
         case EngineState::Slot::Kind::sync_data:
         case EngineState::Slot::Kind::sync_all: {
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+            ++state->research.take_calls;
+#endif
             auto observed = state->scope->take(slot.sync);
             if (observed.readiness == sluice::async::RequestReadiness::pending) {
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+                ++state->research.take_pending;
+#endif
                 break;
             }
             if (observed.readiness == sluice::async::RequestReadiness::empty) {
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+                ++state->research.take_empty;
+#endif
                 fail_closed("getevents", "lost accepted request (ticket resolves to no slot)");
             }
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+            ++state->research.take_ready;
+#endif
             complete_void_observation(slot.u, observed.result);
             state->staged.push_back(EngineState::Completion{slot.u});
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+            state->research.note_staged(state->staged.size());
+#endif
             release_slot(state, i);
             break;
         }
@@ -127,6 +164,10 @@ void harvest(EngineState* state, unsigned int max) {
             break;
         }
     }
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+    state->research.harvest_slots_examined += examined;
+    state->research.note_scan_length(examined);
+#endif
 }
 
 // Health-failure settlement (ADAPTER-ARCHITECTURE §5.5). Tier 1: this thread
@@ -165,6 +206,9 @@ int sluice_getevents(struct thread_data* td, unsigned int min, unsigned int max,
     if (state == nullptr) {
         fail_closed("getevents", "engine state missing (init failed or skipped)");
     }
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+    ++state->research.getevents_calls;
+#endif
     if (state->staged_cursor != state->staged.size()) {
         fail_closed("getevents", "previous completion batch was not fully consumed by event()");
     }

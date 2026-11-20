@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -41,13 +42,23 @@ def render_main(norm: dict) -> str:
                     agg.setdefault(label, []).append(cell["value"])
         vals = {label: (sum(v) / len(v) if v else None)
                 for label, v in agg.items()}
-        ios = pmu[0].get("denominator")
+        # Per-op is the mean of per-rep ratios; the reps do NOT share a
+        # denominator, so the row must show every rep's denominator rather
+        # than the first one only (audit R1-21).
+        denominators = [r.get("denominator") for r in pmu
+                        if r.get("denominator") is not None]
+        # Collapse consecutive duplicates (C2 reps share one denominator).
+        unique = []
+        for d in denominators:
+            if not unique or unique[-1] != d:
+                unique.append(d)
+        ios = "/".join(str(d) for d in unique) if unique else None
         rows.append({"cell": entry["cell"], "engine": entry["engine"],
                      "reps": len(pmu), "ios": ios, "vals": vals})
     if not rows:
         return "(no pmu rows)\n"
     out = ["| cell | engine | reps | instr/op (u) | cycles/op (u) | "
-           "cpu-us/op (task total) | denominator |\n",
+           "cpu-us/op (task total) | denominator (per rep) |\n",
            "|---|---|---:|---:|---:|---:|---:|\n"]
     for r in rows:
         out.append("| %s | %s | %d | %s | %s | %s | %s |\n" % (
@@ -170,26 +181,98 @@ def render_rusage(norm: dict) -> str:
 
 
 def render_h(norm: dict, window: dict) -> str:
-    """H1-H6 provisional classification is authored with data at hand; the
-    renderer only injects the metric availability notes per row."""
-    return ("window verdict: %s; A2-vs-C2 instr delta pct: %s\n"
+    """H1-H6 classification is authored with the data at hand; the
+    renderer injects the live window-contract values so the document
+    cannot drift from analysis/window-contract.json."""
+    native = (window.get("per_engine") or {}).get("io_uring") or {}
+    delta = native.get("delta_pct_of_C")
+    return ("window verdict: %s; native A2-vs-C2 instr delta pct: %s; "
+            "direction: %s; mechanism: %s\n"
             % (window.get("verdict"),
-               window.get("A2_vs_C2_instructions_delta_pct")))
+               "UNAVAILABLE" if delta is None else delta,
+               native.get("direction_vs_startup", "UNAVAILABLE"),
+               native.get("cross_mode_mechanism", "UNAVAILABLE")))
+
+
+def render_bpf(norm: dict) -> str:
+    """eBPF rows carry their own evidence class. LOSSY rows are rendered
+    as lower bounds with invalid dwell; UNAVAILABLE rows never show a
+    zero count (audit R1-8)."""
+    rows = []
+    for key, entry in sorted(norm.items()):
+        for row in (entry.get("trace-bpf") or []):
+            rows.append((key, row))
+    if not rows:
+        return "(no trace-bpf rows)\n"
+    out = ["| run | label | scope | evidence | counts |\n",
+           "|---|---|---|---|---|\n"]
+    for key, row in rows:
+        label = row.get("label")
+        if label == "EBPF_LOSSY":
+            summary = row.get("summary") or {}
+            counts = json.dumps(summary.get("counts") or {},
+                                sort_keys=True)
+            evidence = ("lower bound; dwell INVALID; %s"
+                        % row.get("reliability"))
+        elif label == "EBPF_UNAVAILABLE":
+            counts = "UNAVAILABLE"
+            evidence = row.get("reliability")
+        else:
+            counts = json.dumps((row.get("summary") or {}).get("counts")
+                                or {}, sort_keys=True)
+            evidence = ("comm-filtered aggregate; "
+                        "not proof of zero loss")
+        out.append("| %s | %s | %s | %s | %s |\n" % (
+            row.get("run_id") or key, label, row.get("scope"),
+            evidence, counts))
+    return "".join(out)
+
+
+def _replace_section(text: str, begin: str, end: str,
+                     body: str) -> tuple[str, int]:
+    pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end),
+                         re.S)
+    return pattern.subn(begin + "\n" + body.strip() + "\n" + end, text,
+                        count=1)
 
 
 def fill_ledger(session_dir: pathlib.Path, ledger_path: pathlib.Path) -> None:
+    """Regenerate the marked ledger sections from the recomputed analysis.
+    Placeholder-token replacement silently did nothing because the real
+    ledger uses BEGIN/END markers (audit R1-6); a missing marker is now an
+    error, not a false success."""
     norm = json.loads((session_dir / "analysis" / "normalized-costs.json")
                       .read_text())
     window = json.loads((session_dir / "analysis" / "window-contract.json")
                         .read_text())
     text = ledger_path.read_text()
-    text = text.replace("LEDGER_PLACEHOLDER", render_main(norm).strip())
-    text = text.replace("TRACE_PLACEHOLDER", render_trace(norm).strip())
-    text = text.replace("RUSAGE_PLACEHOLDER", render_rusage(norm).strip())
-    text = text.replace("PERTURBATION_PLACEHOLDER",
-                        render_perturbation(norm).strip())
-    text = text.replace("H_PLACEHOLDER", render_h(norm, window).strip())
+    replacements = (
+        ("<!-- LEDGER-DATA:BEGIN -->", "<!-- LEDGER-DATA:END -->",
+         render_main(norm)),
+        ("<!-- TRACE-DATA:BEGIN -->", "<!-- TRACE-DATA:END -->",
+         render_trace(norm)),
+        ("<!-- PERTURBATION:BEGIN -->", "<!-- PERTURBATION:END -->",
+         render_perturbation(norm)),
+    )
+    replaced = 0
+    for begin, end, body in replacements:
+        text, count = _replace_section(text, begin, end, body)
+        replaced += count
+    # Optional eBPF section (present in root-session ledgers only).
+    if norm_has_trace_bpf(norm):
+        text, count = _replace_section(
+            text, "<!-- BPF-DATA:BEGIN -->", "<!-- BPF-DATA:END -->",
+            render_bpf(norm))
+        replaced += count
+    if replaced == 0:
+        raise SystemExit("no LEDGER-DATA/TRACE-DATA/PERTURBATION markers "
+                         "found in %s; refusing to report success"
+                         % ledger_path)
     ledger_path.write_text(text)
+
+
+def norm_has_trace_bpf(norm: dict) -> bool:
+    return any(entry.get("trace-bpf") for entry in norm.values())
 
 
 if __name__ == "__main__":

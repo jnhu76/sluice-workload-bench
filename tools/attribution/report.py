@@ -25,8 +25,7 @@ from . import parse_bpftrace, parse_perf, parse_trace
 
 RANKED_EXCLUDED_PREFIXES = ("F3",)  # environment-confounded, never ranked
 MODES = ("clean", "clean0", "pmu", "pmu-aux1", "pmu-aux2",
-         "pmu-root-g1", "pmu-root-g2", "pmu-root-g3",
-         "record", "record-root", "record-root-k",
+         "pmu-root", "record", "record-root", "record-root-kernel",
          "trace-bare", "trace-straced", "trace-shape", "trace-bpf")
 
 
@@ -66,11 +65,16 @@ def fio_metrics(raw: str) -> dict | None:
         return None
     bs_min = None
     opts = job.get("job options") or {}
-    bs_txt = str(opts.get("bs") or "4k")
-    m = re.match(r"(\d+)([kmKM]?)", bs_txt)
-    if m:
-        mult = {"": 1, "k": 1024, "m": 1024 * 1024}.get(m.group(2).lower(), 1)
-        bs_min = int(m.group(1)) * mult
+    bs_txt = str(opts.get("bs") or "")
+    # Only a single uniform block size can serve as the lifecycle
+    # denominator. Mixed/range forms ("4k:64k", "4k,64k", "4k-64k") are
+    # refused instead of silently taking the first token.
+    if bs_txt and not re.search(r"[:,\-]", bs_txt):
+        m = re.fullmatch(r"(\d+)([kmKM]?)", bs_txt.strip())
+        if m:
+            mult = {"": 1, "k": 1024,
+                    "m": 1024 * 1024}.get(m.group(2).lower(), 1)
+            bs_min = int(m.group(1)) * mult
     out = {"job_name": job.get("jobname"), "bs_bytes": bs_min,
            "usr_cpu": job.get("usr_cpu"), "sys_cpu": job.get("sys_cpu"),
            "iodepth_level": job.get("iodepth_level"),
@@ -118,7 +122,14 @@ def load_run(run_dir: pathlib.Path) -> dict | None:
     fio_p = run_dir / "fio-result.json"
     if not meta_p.exists():
         return None
-    meta = json.loads(meta_p.read_text())
+    try:
+        meta = json.loads(meta_p.read_text())
+    except (ValueError, OSError) as exc:
+        # A corrupted receipt must be excluded, not crash the recompute.
+        return {"run_id": run_dir.name, "dir": str(run_dir), "meta": {},
+                "job_text": "", "metrics": None, "perf": None,
+                "trace": None, "discarded": True, "unreadable": True,
+                "unreadable_reason": "malformed meta.json: %s" % exc}
     job_p = run_dir / "fio-job.fio"
     job_text = job_p.read_text() if job_p.exists() else ""
     run = {"run_id": run_dir.name, "dir": str(run_dir), "meta": meta,
@@ -147,9 +158,16 @@ def load_run(run_dir: pathlib.Path) -> dict | None:
     if bpf_p.exists():
         err_p = run_dir / "bpftrace.stderr.txt"
         stderr = err_p.read_text() if err_p.exists() else ""
+        attach = ""
+        for line in stderr.splitlines():
+            if line.strip().startswith("Attached "):
+                attach = line.strip()
+                break
         run["bpftrace"] = {
             "maps": parse_bpftrace.parse_maps(bpf_p.read_text()),
             "lost_events": parse_bpftrace.detect_lost(stderr),
+            "stderr": stderr,
+            "attach_line": attach,
         }
     return run
 
@@ -166,6 +184,14 @@ def split_run_id(run_id: str) -> dict:
             "retry": bool(m and m.group(2))}
 
 
+def parse_ramp_time(job_text: str) -> int | None:
+    """Anchored ramp_time parser. A substring test for "ramp_time=0" also
+    matches "ramp_time=0.5", which would silently accept a mismatched
+    window; every per-op row needs its OWN job receipt to say 0."""
+    m = re.search(r"(?m)^\s*ramp_time\s*=\s*(\d+)\s*$", job_text or "")
+    return int(m.group(1)) if m else None
+
+
 def per_op_row(run: dict, window: str) -> dict:
     """Build the per-op row for one pmu run under a denominator policy.
     Returns {'status': 'ok'|'REFUSED', ...} -- refused rows carry the
@@ -175,7 +201,18 @@ def per_op_row(run: dict, window: str) -> dict:
     ios = metrics.get("lifecycle_ios")
     perf = run["perf"] or {}
     row = {"status": "REFUSED", "window": window,
-           "denominator": None, "values": {}}
+           "window_verified": False, "denominator": None, "values": {}}
+    ramp = parse_ramp_time(run.get("job_text") or "")
+    if ramp is None:
+        row["reason"] = ("no ramp_time receipt in the run's job text; "
+                         "measurement window cannot be verified")
+        return row
+    if ramp != 0:
+        row["reason"] = ("ramp_time=%d: perf window includes ramp but the "
+                         "io_bytes denominator does not; per-op refused"
+                         % ramp)
+        return row
+    row["window_verified"] = True
     if not ios or ios <= 0:
         row["reason"] = ("no lifecycle denominator (io_bytes missing or "
                          "non-uniform bs)")
@@ -228,19 +265,31 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
     """Full recompute. Writes analysis/*.json, returns the analysis doc."""
     session_dir = session_dir.resolve()
     runs_dir = session_dir / "runs"
+    if not runs_dir.is_dir():
+        raise SystemExit("analyze: no runs directory at %s" % runs_dir)
     analysis_dir = session_dir / "analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)
     capability = None
+    capability_error = None
     cap_path = session_dir / "capability.json"
     if cap_path.exists():
-        capability = json.loads(cap_path.read_text())
+        try:
+            capability = json.loads(cap_path.read_text())
+        except (ValueError, OSError) as exc:
+            capability_error = "malformed capability.json: %s" % exc
 
     runs = []
     sha_mismatch = []
     revision = None
-    binrev_path = session_dir / "binary-manifest.json"
-    if binrev_path.exists():
-        revision = json.loads(binrev_path.read_text()).get("sluice_revision")
+    manifest = None
+    manifest_error = None
+    manifest_path = session_dir / "binary-manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            revision = manifest.get("sluice_revision")
+        except (ValueError, OSError) as exc:
+            manifest_error = "malformed binary-manifest.json: %s" % exc
     for run_dir in sorted(p for p in runs_dir.iterdir()
                           if p.is_dir() and not p.name.startswith(".")):
         run = load_run(run_dir)
@@ -258,6 +307,50 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
                                      "engine_rev": load_line[0],
                                      "session_rev": revision})
         runs.append(run)
+
+    # Evidence gate: record/record-root attribution compares a diagnostic
+    # binary against the release baseline, so the manifest and its
+    # .text-section identity proof are REQUIRED for those modes. A missing
+    # or unproven manifest is not "clean" -- it is fail-closed.
+    record_modes = {"record", "record-root", "record-root-k"}
+    uses_record = any(
+        (split_run_id(r["run_id"]).get("mode") in record_modes)
+        and not r.get("discarded") for r in runs)
+    text_mismatch = []
+    engines = (manifest or {}).get("engines") or {}
+    # Only external .so engines have a sym-twin proof; io_uring/psync are
+    # covered by the diagnostic fio binary hash instead.
+    external_engines = {"sluice-uring", "sluice-threadpool"}
+    used_engines = {split_run_id(r["run_id"]).get("engine")
+                    for r in runs
+                    if split_run_id(r["run_id"]).get("mode") in record_modes}
+    for engine in sorted(e for e in used_engines
+                         if e and e in external_engines):
+        row = engines.get(engine) or {}
+        if row.get("text_section_match") is not True:
+            text_mismatch.append(engine)
+    fio_diag = (manifest or {}).get("fio_diag") or {}
+    fio_diag_proven = bool(fio_diag.get("sha256"))
+    provenance_missing = [
+        r["run_id"] for r in runs
+        if split_run_id(r["run_id"]).get("mode") in record_modes
+        and not r.get("discarded")
+        and split_run_id(r["run_id"]).get("engine") in external_engines
+        and not r["meta"].get("engine_load")]
+    if not runs:
+        manifest_gate = "NO_RUNS"
+    elif uses_record and manifest is None:
+        manifest_gate = "MISSING"
+    elif text_mismatch:
+        manifest_gate = "TEXT_SECTION_MISMATCH"
+    elif uses_record and not fio_diag_proven:
+        manifest_gate = "FIO_DIAG_UNPROVEN"
+    elif provenance_missing:
+        manifest_gate = "ENGINE_LOAD_MISSING"
+    elif manifest is not None and manifest_error:
+        manifest_gate = "UNREADABLE"
+    else:
+        manifest_gate = "OK" if manifest is not None else "NOT_REQUIRED"
 
     # Group by (cell, engine) keeping modes SEPARATE (no cross-mode merge).
     cells: dict = {}
@@ -293,6 +386,16 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
                     row["iops"] = direction.get("iops")
                     row["clat_p99_us"] = direction.get("clat_p99_us")
                     _attach_aux(row, run, mode)
+                    if mode != "pmu":
+                        # Aux runs carry no core events: their validity is
+                        # decided by the aux events, not by the (always
+                        # REFUSED) main-event row.
+                        aux = row.get("aux_events") or {}
+                        if any(v.get("class") == "counted"
+                               for v in aux.values()):
+                            row["main_status"] = row["status"]
+                            row["main_reason"] = row.pop("reason", None)
+                            row["status"] = "ok"
                     rows.append(row)
                 entry[mode] = rows
         if "record" in group["modes"]:
@@ -309,7 +412,9 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
                 entry[tmode] = [
                     _trace_row(r) for r in group["modes"][tmode]]
         # Root PMU: every counted event, scope derived from the :u/:k
-        # suffix; kernel rows are now REAL counts (capability FULL).
+        # suffix; kernel rows are now REAL counts for the measured scopes
+        # (capability FULL_FOR_MEASURED_SCOPES: :k PMU is measured,
+        # io-wq/kworker and IRQ/softirq are not).
         for mode in ("pmu-root-g1", "pmu-root-g2", "pmu-root-g3"):
             if mode in group["modes"]:
                 rows = []
@@ -345,8 +450,12 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
     # Authoritative per-run index rebuilt from run dirs (the append-only
     # runs-manifest.json accumulated duplicates across repair invocations).
     index = []
+    excluded_unparsed = []
     for run in runs:
         parts = split_run_id(run["run_id"])
+        unparsed = not parts
+        if unparsed and not run.get("discarded"):
+            excluded_unparsed.append(run["run_id"])
         index.append({
             "run_id": run["run_id"],
             "cell": parts.get("cell"), "engine": parts.get("engine"),
@@ -354,6 +463,8 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
             "retry": parts.get("retry"),
             "status": (run["meta"].get("status")),
             "discarded": bool(run.get("discarded")),
+            "excluded_reason": ("unparseable run id / prep / superseded"
+                                if unparsed else None),
             "dir": str(pathlib.Path(run["dir"]).name),
         })
     (analysis_dir / "runs-index.json").write_text(
@@ -372,22 +483,53 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
                     merged = True
                 mode_by_run[rid] = mode
     sampled_isolated = all(
-        row.get("class") == "SAMPLED"
+        str(row.get("class", "")).startswith("SAMPLED")
         and "values" not in row and "per_op" not in row
         for entry in normalized.values()
-        for row in (entry.get("record") or []))
+        for mode in ("record", "record-root", "record-root-kernel")
+        for row in (entry.get(mode) or []))
+    ebpf_rows = [row for entry in normalized.values()
+                 for row in (entry.get("trace-bpf") or [])]
+    ebpf = {
+        "rows": len(ebpf_rows),
+        "counted_runs": [r["run_id"] for r in ebpf_rows
+                         if r.get("label") == "EBPF_COUNTED"],
+        "lossy_runs": [r["run_id"] for r in ebpf_rows
+                       if r.get("label") == "EBPF_LOSSY"],
+        "unavailable_runs": [r["run_id"] for r in ebpf_rows
+                             if r.get("label") == "EBPF_UNAVAILABLE"],
+        "scope": "HOST_ISOLATED_AGGREGATE",
+    }
+    sha_mismatch_free = (not sha_mismatch and not manifest_error
+                         and manifest_gate in ("OK", "NOT_REQUIRED"))
     analysis = {
         "schema": 1,
         "session": str(session_dir.name),
         "runs_total": len(runs),
         "runs_discarded": sum(1 for r in runs if r.get("discarded")),
+        "runs_unparsed_excluded": excluded_unparsed,
         "sha_mismatch": sha_mismatch,
-        "sha_mismatch_free": not sha_mismatch,
+        "sha_mismatch_text": text_mismatch,
+        "sha_mismatch_provenance": provenance_missing,
+        "sha_mismatch_free": sha_mismatch_free,
+        "binary_manifest": {
+            "present": manifest is not None,
+            "gate": manifest_gate,
+            "error": manifest_error,
+            "sluice_revision": revision,
+            "record_modes_present": uses_record,
+            "fio_diag_proven": fio_diag_proven,
+        },
         "cpu_accounting_verdict":
             (capability or {}).get("cpu_accounting_verdict",
                                    "UNKNOWN_NO_CAPABILITY_FILE"),
+        "cpu_accounting_scopes":
+            (capability or {}).get("cpu_accounting_scopes", {}),
+        "capability_error": capability_error,
         "window_contract": window["verdict"],
+        "window_contract_detail": window,
         "normalized": normalized,
+        "ebpf": ebpf,
         "ranking": ranking,
         "comparisons": comparisons,
         "invariants": {
@@ -398,6 +540,10 @@ def analyze_session(session_dir: pathlib.Path) -> dict:
                 e["engine"] != "psync" for e in ranking),
             "modes_never_merged": not merged,
             "sampled_isolated": sampled_isolated,
+            "ebpf_lossy_not_exact": all(
+                r.get("label") != "EBPF_LOSSY"
+                or r.get("summary", {}).get("dwell_invalid") is True
+                for r in ebpf_rows),
         },
     }
     (analysis_dir / "analysis.json").write_text(
@@ -443,7 +589,8 @@ def _aggregate_clean(clean_runs: list, window_matched: bool) -> dict:
     # window-matched when its OWN job text carries ramp_time=0.
     per_op = []
     for run in clean_runs:
-        if "ramp_time=0" not in (run.get("job_text") or ""):
+        # Anchored parse: "ramp_time=0.5" must NOT be treated as ramp=0.
+        if parse_ramp_time(run.get("job_text") or "") != 0:
             continue
         m = run["metrics"] or {}
         ios = m.get("lifecycle_ios")
@@ -510,8 +657,26 @@ def _root_pmu_row(run: dict) -> dict:
     ios = metrics.get("lifecycle_ios")
     direction = ((metrics.get("directions") or {}).get("read") or {})
     row = {"status": "REFUSED", "window": "process_lifecycle",
+           "window_verified": False,
+           "denominator_kind": "lifecycle_ios",
+           "label": "PROCESS_LIFECYCLE_*_per_op",
+           "scope_note": "task-clock/task_total = user+sys of the fio "
+                         "process tree (not user-only); :k counts cover "
+                         "that process tree only, not io-wq/kworker or "
+                         "IRQ/softirq; excludes io-wq/kworkers",
            "denominator": ios, "iops": direction.get("iops"),
            "values": {}}
+    ramp = parse_ramp_time(run.get("job_text") or "")
+    if ramp is None:
+        row["reason"] = ("no ramp_time receipt; measurement window cannot "
+                         "be verified")
+        return row
+    if ramp != 0:
+        row["reason"] = ("ramp_time=%d: perf window includes ramp but the "
+                         "io_bytes denominator does not; per-op refused"
+                         % ramp)
+        return row
+    row["window_verified"] = True
     if not ios:
         row["reason"] = "no lifecycle denominator"
         return row
@@ -544,28 +709,69 @@ def _root_pmu_row(run: dict) -> dict:
 def _bpf_row(run: dict) -> dict:
     metrics = run["metrics"] or {}
     ios = metrics.get("lifecycle_ios")
-    summary = {}
-    lost = None
-    if run.get("bpftrace"):
-        summary = parse_bpftrace.summarize(run["bpftrace"]["maps"], ios)
-        lost = run["bpftrace"]["lost_events"]
     direction = ((metrics.get("directions") or {}).get("read") or {})
-    label = "EBPF_COUNTED"
-    reliability = "counts exact; no lost-event report"
+    receipt = run.get("bpftrace")
+    maps = (receipt or {}).get("maps") or {}
+    lost = (receipt or {}).get("lost_events")
+    attach = (receipt or {}).get("attach_line") or ""
+    base = {"run_id": run["run_id"], "lifecycle_ios": ios,
+            "iops": direction.get("iops"), "lost_events": lost,
+            "attach_line": attach,
+            "join": "NOT_ATTEMPTED (aggregate counts only)"}
+    if not receipt:
+        # Missing map dump/receipt: never a counted zero.
+        base.update({"label": "EBPF_UNAVAILABLE", "summary": {},
+                     "scope": "UNAVAILABLE",
+                     "reliability": "no bpftrace map dump; counts "
+                                    "UNAVAILABLE"})
+        return base
+    if not maps:
+        base.update({"label": "EBPF_UNAVAILABLE", "summary": {},
+                     "scope": "UNAVAILABLE",
+                     "reliability": "empty bpftrace map dump (killed or "
+                                    "failed before exit); counts UNAVAILABLE"})
+        return base
+    if not attach:
+        base.update({"label": "EBPF_UNAVAILABLE", "summary": {},
+                     "scope": "UNAVAILABLE",
+                     "reliability": "no 'Attached N probes' receipt; attach "
+                                    "could not be proven; counts UNAVAILABLE"})
+        return base
+    parts = split_run_id(run["run_id"])
+    io_uring_applicable = parts.get("engine") != "sluice-threadpool"
+    summary = parse_bpftrace.summarize(
+        maps, ios, io_uring_applicable=io_uring_applicable)
+    if not summary.get("fio_keyed"):
+        base.update({"label": "EBPF_UNAVAILABLE", "summary": summary,
+                     "scope": "UNAVAILABLE",
+                     "reliability": "no fio-keyed counter in the map dump; "
+                                    "other comms only, counts UNAVAILABLE"})
+        return base
+    if summary.get("required_missing"):
+        base.update({"label": "EBPF_UNAVAILABLE", "summary": summary,
+                     "scope": "UNAVAILABLE",
+                     "reliability": "required io_uring maps missing: %s; "
+                                    "counts UNAVAILABLE"
+                                    % ",".join(summary["required_missing"])})
+        return base
+    reliability = ("comm-aggregated counts (HOST_ISOLATED_AGGREGATE); "
+                   "no Lost-events line reported (not proof of zero loss)")
     if lost:
         # #623 coverage class CAPTURE_DROPPED: counts become lower bounds,
         # dwell-derived values are invalid, and no precise claim is allowed.
-        label = "EBPF_LOSSY"
-        reliability = ("CAPTURE_DROPPED: %d events lost; counters are "
-                       "lower bounds, dwell INVALID" % lost)
         summary = {"per_op_lower_bound": (summary or {}).get("per_op"),
                    "dwell_invalid": True,
                    "counts": (summary or {}).get("counts")}
-    return {"run_id": run["run_id"], "label": label,
-            "lifecycle_ios": ios, "iops": direction.get("iops"),
-            "summary": summary, "lost_events": lost,
-            "reliability": reliability,
-            "join": "NOT_ATTEMPTED (aggregate counts only)"}
+        base.update({
+            "label": "EBPF_LOSSY", "summary": summary,
+            "scope": "HOST_ISOLATED_AGGREGATE",
+            "reliability": "CAPTURE_DROPPED: %d events lost; counters are "
+                           "lower bounds, dwell INVALID" % lost})
+        return base
+    base.update({"label": "EBPF_COUNTED", "summary": summary,
+                 "scope": "HOST_ISOLATED_AGGREGATE",
+                 "reliability": reliability})
+    return base
 
 
 def _trace_row(run: dict) -> dict:
@@ -587,29 +793,74 @@ def _trace_row(run: dict) -> dict:
     return out
 
 
+OPTION_B_MODES = ("pmu", "pmu-root-g1", "pmu-root-g2", "pmu-root-g3")
+
+
+def _direction_vs_startup(wall_b, wall_c, per_op_b, per_op_c) -> str:
+    """If C2 runs longer it amortizes startup better, so its per-op value
+    should be LOWER. The reverse (longer C2 yet higher per-op, or shorter
+    C2 yet lower per-op) is the opposite of startup amortization."""
+    if None in (wall_b, wall_c, per_op_b, per_op_c):
+        return "UNKNOWN"
+    if wall_c > wall_b:
+        return "OPPOSITE" if per_op_c >= per_op_b else "CONSISTENT"
+    if wall_c < wall_b:
+        return "OPPOSITE" if per_op_c <= per_op_b else "CONSISTENT"
+    return "UNKNOWN"
+
+
+def _mean_wall(cells: dict, cell: str, engine: str, mode: str):
+    group = cells.get((cell, engine))
+    if not group or mode not in group.get("modes", {}):
+        return None
+    vals = [run["meta"].get("wall_s") for run in group["modes"][mode]
+            if run["meta"].get("wall_s") is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
 def _window_contract(cells: dict) -> dict:
-    """Option B vs Option C, computed PER ENGINE (an audit finding: the
-    original version only checked io_uring). The delta is |B-C|/C using
-    the mean of all valid reps; n(C) is reported because C2 is a single
-    run per engine in this session."""
-    verdict = {"option_B": "present" if any(
-        "pmu" in group["modes"] for group in cells.values()) else "absent"}
-    for (cell, engine), group in cells.items():
-        if cell != "C2":
-            continue
-        for mode in ("clean", "pmu"):
-            if mode in group["modes"]:
-                verdict["option_C_%s" % mode] = "present"
+    """Option B vs Option C, computed PER ENGINE. The delta is |B-C|/C
+    using the mean of all valid reps. The A2-vs-C2 difference changes the
+    time basis as well as the window, so it cannot identify startup cost
+    on its own: the direction check and the mechanism label are part of
+    the contract."""
+    option_b = any(mode in group["modes"]
+                   for group in cells.values()
+                   for mode in OPTION_B_MODES)
+    option_c = any(cell == "C2" and "pmu" in group["modes"]
+                   for (cell, _engine), group in cells.items())
+    verdict = {
+        "option_B": "present" if option_b else "absent",
+        "option_C": "present" if option_c else "absent",
+        "option_C_kind": "FIXED_IO_SIZE_COUNT" if option_c else "ABSENT",
+        "window": "ramp_time=0 process_lifecycle",
+        "denominator": "lifecycle_ios (read.io_bytes/bs, same run)",
+    }
     per_engine = {}
     for engine in ("io_uring", "sluice-uring", "sluice-threadpool"):
         b = _mean_per_op(cells, "A2", engine, "pmu")
         c = _mean_per_op(cells, "C2", engine, "pmu")
         if b is None or c is None or not c:
             continue
+        wall_b = _mean_wall(cells, "A2", engine, "pmu")
+        wall_c = _mean_wall(cells, "C2", engine, "pmu")
+        delta = round(abs(b - c) / c * 100, 3)
+        direction = _direction_vs_startup(wall_b, wall_c, b, c)
         per_engine[engine] = {
             "A2_instr_per_op": round(b, 3),
             "C2_instr_per_op": round(c, 3),
-            "delta_pct_of_C": round(abs(b - c) / c * 100, 3),
+            "A2_wall_s": None if wall_b is None else round(wall_b, 3),
+            "C2_wall_s": None if wall_c is None else round(wall_c, 3),
+            "delta_pct_of_C": delta,
+            "direction_vs_startup": direction,
+            "cross_mode_mechanism": (
+                "MODE_OR_TIMING_EFFECT_NOT_IDENTIFIED"
+                if direction == "OPPOSITE" else
+                "STARTUP_AMORTIZATION_CONSISTENT"
+                if direction == "CONSISTENT" else "NOT_IDENTIFIED"),
+            "cross_mode_uncertainty_pct": delta,
+            "per_op_class": ("lifecycle_only" if delta > 10.0
+                             else "lifecycle_primary"),
             "C2_reps": _count_ok(cells, "C2", engine, "pmu"),
             "A2_reps": _count_ok(cells, "A2", engine, "pmu"),
         }
@@ -619,17 +870,26 @@ def _window_contract(cells: dict) -> dict:
     if native_delta is not None:
         verdict["startup_share_bound_pct"] = native_delta
         verdict["startup_share_bound_ok"] = native_delta <= 10.0
+        verdict["startup_share_bound_scope"] = \
+            "NATIVE_TOTAL_CROSS_MODE_DIFF_UPPER_BOUND"
     if native_delta is not None and native_delta <= 10.0:
         verdict["verdict"] = "PROCESS_LIFECYCLE_PRIMARY_NATIVE_VERIFIED"
         verdict["sluice_cross_mode_pct"] = per_engine.get(
             "sluice-uring", {}).get("delta_pct_of_C")
         verdict["note"] = (
-            "native 的 B/C 差（启动+模式）<=10%；sluice-uring 的跨模式差"
-            "更大且方向与启动摊销相反（C2 更长却更高），必须按"
-            "MODE_EFFECT 解释，sluice 的 per-op 值携带该量级的跨模式"
-            "不确定度（非启动污染）")
+            "native 的 |A2-C2|/C <=10% 只说明 native 的总跨模式差不超过 "
+            "10%，不是“启动/收尾 <=1%”的证明，也不是 sluice/TP 的精度；"
+            "C2 同时改变时间基准，差值不能单独识别启动成本。sluice/TP "
+            "的跨模式差按 MODE_OR_TIMING_EFFECT_NOT_IDENTIFIED 处理，其 "
+            "per-op 值携带同量级的跨模式不确定度。")
+    elif per_engine:
+        verdict["verdict"] = "LIFECYCLE_ONLY_NO_STEADY_STATE_EXTRAPOLATION"
+        verdict["reason"] = ("native A2/C2 difference exceeds the "
+                             "pre-registered 10% gate")
     else:
         verdict["verdict"] = "LIFECYCLE_ONLY_NO_STEADY_STATE_EXTRAPOLATION"
+        verdict["reason"] = ("no C2 fixed-count cross-check in this "
+                             "session; Option B is lifecycle-only")
     return verdict
 
 

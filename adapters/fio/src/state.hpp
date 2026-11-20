@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "research_counters.hpp"
 #include "fio_cxx.hpp"
 
 namespace fio_sluice {
@@ -61,6 +62,11 @@ struct EngineState {
     unsigned int pending_submits = 0;
 
     bool failed = false;
+
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+    ResearchCounters research;
+    unsigned int research_workers = 0;
+#endif
 
     bool outstanding() const noexcept {
         return free_slots.size() != slots.size();

@@ -75,6 +75,9 @@ enum fio_q_status sluice_queue(struct thread_data* td, struct io_u* io_u) {
 
     auto reject = [&](const sluice::IoError& error) {
         state->free_slots.push_back(index);
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+        ++state->research.submit_rejected_calls;
+#endif
         const auto mapped = map_errno(error);
         if (mapped.needs_diag) {
             log_err("fio-sluice: submit rejected ddir=%d: code=%s os_errno=%d -> errno=%d\n",
@@ -87,6 +90,13 @@ enum fio_q_status sluice_queue(struct thread_data* td, struct io_u* io_u) {
 
     try {
         if (ddir == DDIR_READ || ddir == DDIR_WRITE) {
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+            if (ddir == DDIR_READ) {
+                ++state->research.submit_read_calls;
+            } else {
+                ++state->research.submit_write_calls;
+            }
+#endif
             auto ticket = ddir == DDIR_READ
                 ? state->scope->submit_read({file,
                                              static_cast<std::byte*>(io_u->xfer_buf),
@@ -107,6 +117,9 @@ enum fio_q_status sluice_queue(struct thread_data* td, struct io_u* io_u) {
             ++state->pending_submits;
             return FIO_Q_QUEUED;
         }
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+        ++state->research.submit_sync_calls;
+#endif
         auto ticket = ddir == DDIR_SYNC ? state->scope->submit_sync_all({file})
                                         : state->scope->submit_sync_data({file});
         if (!ticket.has_value()) {

@@ -6,6 +6,10 @@
 --   sluice-workload-bench-ring   bench binary, ring non-PIC SDK + -luring
 --   fio-sluice-noring            fio external engine .so, noring PIC SDK
 --   fio-sluice-ring              fio external engine .so, ring PIC SDK
+--   fio-sluice-ring-research     research twin of fio-sluice-ring: adapter
+--                                + core counters from the dedicated Sluice
+--                                worktree, gated by
+--                                SLUICE_FIO_RESEARCH_COUNTERS; never release
 --   fio-sluice-errno-map-test    IoError->errno mapping unit test
 --   fio-sluice-lifecycle-test    engine lifecycle contract test (links the
 --                                real engine TUs against stub fio-core
@@ -174,6 +178,71 @@ local function api_ensure_sdk(api, profile, pic)
     end
 end
 
+-- Research build profile: the adapter .so links a separately built SDK from
+-- a dedicated Sluice worktree whose async headers/library carry
+-- SLUICE_FIO_RESEARCH_COUNTERS instrumentation. The worktree is expected to
+-- be dirty by design (instrumentation without a commit); only its HEAD is
+-- pinned to SLUICE_REVISION. The production prefixes above are never touched.
+local research_source_default = "/home/jnhu/sluice-userspace-research"
+
+local function research_sdk_prefix(profile)
+    return path.join(build_root, profile .. "-pic-research")
+end
+
+local function api_research_source(api)
+    local source = api.os.getenv("SLUICE_RESEARCH_SOURCE")
+    if not source or source == "" then
+        source = research_source_default
+    end
+    return path.absolute(source)
+end
+
+local function api_build_research_sdk(api, profile)
+    local io, os = api.io, api.os
+    local revision = trim(io.readfile(path.join(root, "SLUICE_REVISION")))
+    if revision == "" then
+        raise("SLUICE_REVISION is empty or missing")
+    end
+    local prefix = research_sdk_prefix(profile)
+    local sdk = path.join(prefix, "sdk")
+    local stamp = revision .. "-research1"
+    local ready = path.join(sdk, ".ready")
+    if os.isfile(ready) and trim(io.readfile(ready)) == stamp then
+        return
+    end
+    local source = api_research_source(api)
+    -- A linked worktree stores .git as a file, not a directory.
+    if not (os.isdir(source) and
+            (os.isdir(path.join(source, ".git")) or os.isfile(path.join(source, ".git")))) then
+        raise("research Sluice worktree not found: " .. source ..
+              " (create: git -C <Sluice> worktree add " .. source .. " " .. revision .. ")")
+    end
+    local head = api_shell_output(api, "git -C " .. source .. " rev-parse HEAD")
+    if head ~= revision then
+        raise("research worktree " .. source .. " is at " .. tostring(head) ..
+              ", expected " .. revision)
+    end
+    local header = io.readfile(path.join(source,
+        "include/sluice/async/detail/research_counters.hpp"))
+    if not header or not header:find("SLUICE_FIO_RESEARCH_COUNTERS", 1, true) then
+        raise("research worktree lacks the gated counter header: " .. source)
+    end
+    os.mkdir(sdk)
+    local envs = { XMAKE_STATS = "false" }
+    local olddir = os.cd(source)
+    os.execv("xmake", { "f", "-P", source, "-m", "release",
+                        "--liburing=" .. (profile == "ring" and "y" or "n"),
+                        "--cxxflags=-fPIC", "-y" }, { envs = envs })
+    os.execv("xmake", { "build", "-P", source, "-j", tostring(jobs), "-y",
+                        "sluice_async" }, { envs = envs })
+    os.execv("xmake", { "install", "-P", source, "-o", sdk,
+                        "sluice_core" }, { envs = envs })
+    os.execv("xmake", { "install", "-P", source, "-o", sdk,
+                        "sluice_async" }, { envs = envs })
+    os.cd(olddir)
+    io.writefile(ready, stamp .. "\n")
+end
+
 local function api_ensure_fio_source(api)
     local os = api.os
     if not os.isdir(path.join(fio_dir, ".git")) then
@@ -270,6 +339,35 @@ engine_target("fio-sluice-noring", "noring")
 engine_target("fio-sluice-ring", "ring")
 engine_target("fio-sluice-noring-sym", "noring", true)
 engine_target("fio-sluice-ring-sym", "ring", true)
+
+-- Research twin of fio-sluice-ring: identical adapter sources and profile
+-- flags, plus SLUICE_FIO_RESEARCH_COUNTERS and the research SDK built from
+-- the dedicated worktree. Never a release artifact; its counters and its
+-- extra atomic traffic are the subject of the perturbation measurement.
+target("fio-sluice-ring-research")
+    set_kind("shared")
+    set_filename("fio-sluice-ring-research.so")
+    add_files("adapters/fio/src/*.cpp")
+    add_includedirs(fio_dir)
+    add_defines("SLUICE_FIO_RESEARCH_COUNTERS=1")
+    add_cxxflags("-isystem " .. path.join(research_sdk_prefix("ring"), "sdk", "include"),
+                 { force = true })
+    link_setup(path.join(research_sdk_prefix("ring"), "sdk"), "ring")
+    on_load(function(target)
+        if io ~= nil and io.readfile ~= nil then
+            local revision = trim(io.readfile(path.join(root, "SLUICE_REVISION")))
+            if revision ~= "" then
+                target:add("defines", 'SLUICE_REVISION="' .. revision .. '"',
+                           'SLUICE_BUILD_PROFILE="ring-research"',
+                           'FIO_SOURCE_TAG="' .. fio_tag .. '"')
+            end
+        end
+    end)
+    before_build(function()
+        local api = { io = io, os = os, try = try }
+        api_build_research_sdk(api, "ring")
+        api_ensure_fio_source(api)
+    end)
 
 target("fio-sluice-errno-map-test")
     set_kind("binary")

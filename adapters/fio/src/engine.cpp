@@ -148,6 +148,10 @@ int sluice_init(struct thread_data* td) {
             " iodepth=%zu workers=%u\n",
             SLUICE_REVISION, SLUICE_BUILD_PROFILE, FIO_SOURCE_TAG, wanted, capacity,
             eo->workers);
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+    state->research_workers = eo->workers;
+    state->research.core_before = sluice::async::detail::research::snapshot();
+#endif
     td->io_ops_data = state.release();
     return 0;
 }
@@ -161,6 +165,13 @@ void sluice_cleanup(struct thread_data* td) {
         log_err("fio-sluice: %zu staged completions were never consumed by fio\n",
                 state->staged.size() - state->staged_cursor);
     }
+#if defined(SLUICE_FIO_RESEARCH_COUNTERS)
+    // Emit the steady-state window before finish(): teardown settlement is
+    // not part of the request-path cost this instrumentation studies.
+    state->research.emit(state->backend == Backend::uring ? "uring" : "threadpool",
+                         static_cast<unsigned int>(state->capacity),
+                         state->research_workers);
+#endif
     if (!state->failed && state->scope.has_value()) {
         const auto settled = state->scope->finish();
         if (!settled.has_value()) {
