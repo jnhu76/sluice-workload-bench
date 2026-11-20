@@ -12,6 +12,7 @@ Exit code 0 iff the internal identities hold:
   * core lock closure |predicted - measured| <= 2e-5 for every cell
   * record-root flat groups sum to 100.00% (+/- 0.02)
   * record-root group cyc/op sum equals cycles/op (+/- 1.0)
+  * BPF lock calls/op == 2 * lock pairs/op (+/- 1e-3; attach/detach boundary)
 """
 
 from __future__ import annotations
@@ -202,6 +203,76 @@ def table_record(root):
     return total, abs(cyc_total - cpo)
 
 
+def table_lock_units(root):
+    """Guard the lock call/pair unit boundary.
+
+    A mutex pair is one lock + one unlock = two libc calls. The flat mutex
+    cycles/op divided by *calls* gives 28.6-29.8 cyc/call; divided by *pairs*
+    gives 57.2-59.5 cyc/pair. The early report multiplied a pair count by the
+    per-call price, undercounting by 2x. This function asserts the raw BPF
+    counts satisfy calls/op == 2 * pairs/op (within the attach/detach
+    boundary loss) and prints both prices plus the two derived model values.
+    """
+    print("\n== E3 BPF lock units: calls/op == 2 * pairs/op ==")
+    summary = load_json(os.path.join(root, E3, "analysis", "summary.json"))
+    rows = summary.get("bpf_locks", [])
+    worst = 0.0
+    for r in rows:
+        ios = r["ios"]
+        lock_op = r["lock_calls"] / ios
+        unlock_op = r["unlock_calls"] / ios
+        calls_op = lock_op + unlock_op
+        pairs_op = lock_op  # each lock is paired with exactly one unlock
+        resid = calls_op - 2.0 * pairs_op
+        worst = max(worst, abs(resid))
+        print(f"  {r['run']}: lock/op={lock_op:.6f} unlock/op={unlock_op:.6f} "
+              f"calls/op={calls_op:.6f} pairs/op={pairs_op:.6f} "
+              f"resid={resid:+.2e}")
+    print(f"  worst |calls/op - 2*pairs/op| = {worst:.2e} "
+          f"(threshold 1e-3; BPF attach/detach boundary)")
+
+    # Price units and model values from the same record-root flat used by the report.
+    path = run_dir(root, E3, "A2__sluice-uring__record-root__rep1")
+    flat_path = os.path.join(path, "perf-report-flat.txt")
+    with open(flat_path, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    event_count = int(re.search(r"Event count \(approx\.\):\s*(\d+)", text).group(1))
+    ios = load_json(os.path.join(path, "fio-result.json"))["jobs"][0]["read"]["total_ios"]
+    cpo = event_count / ios
+    groups = group_flat(parse_flat(flat_path))
+    libc_cyc = groups["libc"] / 100.0 * cpo
+    if rows:
+        pairs_op = rows[0]["lock_calls"] / rows[0]["ios"]
+        calls_op = 2.0 * pairs_op
+        call_price = libc_cyc / calls_op
+        pair_price = libc_cyc / pairs_op
+        top2_pct = sum(pct for pct, _cmd, _obj, sym in parse_flat(flat_path)
+                       if sym == "__GI___pthread_mutex_unlock_usercnt"
+                       or sym.startswith("pthread_mutex_lock@@"))
+        top2_cyc = top2_pct / 100.0 * cpo
+        pair_price_top2 = top2_cyc / pairs_op
+        print(f"  libc flat={libc_cyc:.2f} cyc/op; "
+              f"per-call={call_price:.2f}; per-pair={pair_price:.2f}; "
+              f"top-2 per-pair={pair_price_top2:.2f}")
+        c = counters(root, "A2")
+        pending_self = ((groups["scope"] + groups["bridge"]) / 100.0 * cpo
+                        * (c["pending"] / c["take"]))
+        pending_lock_lo = c["pending"] * pair_price_top2
+        pending_lock_hi = c["pending"] * pair_price
+        c1_lo = pending_self + pending_lock_lo
+        c1_hi = pending_self + pending_lock_hi
+        c7_lo = 9.0 * pair_price_top2
+        c7_hi = 9.0 * pair_price
+        print(f"  C1 model: pending_self={pending_self:.1f} + "
+              f"pending_lock={pending_lock_lo:.1f}..{pending_lock_hi:.1f} = "
+              f"{c1_lo:.1f}..{c1_hi:.1f} cyc/op "
+              f"({c1_lo / cpo * 100:.1f}..{c1_hi / cpo * 100:.1f}% of {cpo:.2f}) "
+              f"[INFERRED, not net saving]")
+        print(f"  C7 model: 9 pairs * {pair_price_top2:.2f}..{pair_price:.2f} = "
+              f"{c7_lo:.1f}..{c7_hi:.1f} cyc/op [INFERRED]")
+    return worst
+
+
 def table_pmu_atomic(root):
     print("\n== E3 A2 pmu-atomic (COUNTED) ==")
     for rep in ("rep1", "rep2"):
@@ -280,12 +351,15 @@ def main(argv):
     table_e1(root)
     worst = table_closure(root)
     total, cyc_err = table_record(root)
+    lock_worst = table_lock_units(root)
     table_pmu_atomic(root)
     table_consumer(root)
     table_kernel(root)
-    ok = worst <= 2e-5 and abs(total - 100.0) <= 0.02 and cyc_err <= 1.0
+    lock_ok = lock_worst <= 1e-3
+    ok = (worst <= 2e-5 and abs(total - 100.0) <= 0.02 and cyc_err <= 1.0
+          and lock_ok)
     print(f"\nidentities: closure_ok={worst <= 2e-5} flat_sum_ok={abs(total - 100.0) <= 0.02} "
-          f"flat_cycles_ok={cyc_err <= 1.0}")
+          f"flat_cycles_ok={cyc_err <= 1.0} lock_units_ok={lock_ok}")
     return 0 if ok else 1
 
 

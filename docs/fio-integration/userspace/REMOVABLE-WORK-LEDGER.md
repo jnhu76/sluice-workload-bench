@@ -52,7 +52,7 @@
 | 机制 | harvest 非破坏性（pending 槽不释放，`B:adapters/fio/src/events.cpp:91-171`）；每个 pending take 走 O(C) `resolve_` + 一次 core 锁后才判 pending（`S:src/async/detail/request_core.cpp:325-331`） |
 | counted 证据 | pending/op 1 / 2.5 / 8.5 / 32.5；take/op 2 / 3.5 / 9.5 / 33.5；pending/take 0.50 / 0.714 / 0.895 / 0.970（`E2`） |
 | SAMPLED 证据 | D16 take self 11.68% = 531.5 cyc/op；consume self 3.06% = 139.3；合计 670.8（`E3`，n=1） |
-| 规模（INFERRED） | pending 分摊 self 600.2 + pending core 锁 243.2–253.0 = **843–853 cyc/op（18.5–18.7%）**。**该点估计可能偏高**：pending consume 比 ready 便宜（不拷 outcome、不清 binding、不回收），按调用数平摊 self 会高估；**下界**只算 pending 的 core 锁 = 243–253 cyc/op（5.3–5.6%），上界（self 全额计入）923.8（20.3%）。真值在 [243, 853]，core/fio 未拆 |
+| 规模（INFERRED） | pending 分摊 self 600.2 + pending core 锁 486.4–505.9（8.5 对 × 57.22–59.52 cyc/对）= **1,086.5–1,106.1 cyc/op（约 1,087–1,106；23.9–24.3%）**。**这是模型估计，不是可省净收益**：pending 与 ready 的平均 self 相同、pending core 锁与全部 libc 锁的平均价相同，两个假设均未验证；新方案还要支付就绪登记/单次消费成本。旧稿的 243–253/843–853 把“对”乘以了“次调用”价，已订正；506 = 8.5 × (1,436.16/24.128) 是同一 pair 口径。净节省由 A/B 测出，core/fio 未拆 |
 | 可证伪预测 | take/op → ≈1；core lock/op D16 18.625 → ≈10.125、D64 42.53 → ≈10.03；pending 份额 → ≈0；take+consume self 下降（幅度不可线性外推）；IOPS/CPU 不劣化 |
 | 语义门槛 | 唯一消费、回收谓词、fio 完成观察形状（`staged`/`event`）、陈旧 ticket 返回 `empty` 四条必须保持（`REQUEST_SCOPE_LOOKUP_COST.md` §5.1） |
 | 阻断 | #579 单因素 A/B 未做；Arm D 未跑；#604 G0 未满足 |
@@ -72,7 +72,7 @@
 | 项 | 内容 |
 |---|---|
 | 状态 | **NOT_ADMITTED** |
-| 证据 | 单次 take 58.41（A1，扫描 1.0）→ 53.45（`E4`，8.94）/ 55.95（`E3`，8.94）cyc/take；扫描长度约 9×，单次成本**不升**；D4 全链差 3,260 < D1 3,673 |
+| 证据 | 单次 take 58.41（A1，resolve 1.00 iters/take）→ 53.45（`E4`，6.26）/ 55.95（`E3`，6.26）cyc/take；resolve 迭代约 6.3×，单次成本**不升**；D4 全链差 3,260 < D1 3,673。注：8.94 是 adapter 的 harvest slots/harvest，不是 take 的扫描长度 |
 | 判断 | 无收益证据；ticket 未用 `slot_` 是事实，但“改成 O(1) 能省多少”没有证据，现有数据反对有显著收益 |
 | 升/降级条件 | 只有在 C1 之后仍存在可测的 take self，且能构造“只改索引、不改消费协议”的单因素实验时才复议 |
 
@@ -82,7 +82,7 @@
 |---|---|
 | 状态 | **NO_GO** |
 | 证据 | 增量由 take 调用次数 2→9.5 驱动；单次 take 不随长度上升；D4 全链差 < D1 |
-| 备注 | 现有证据不支持（**非单因素证伪**；见 `USERSPACE-COST-RESEARCH.md` §J.1 与 §D.3） |
+| 备注 | 现有证据不支持（**非单因素证伪**；三个 record root 各 n=1、跨会话，不能作因果证伪；见 `USERSPACE-COST-RESEARCH.md` §J.1 与 §D.3） |
 
 ### C5 — “harvest 扫描是用户态主成本”
 
@@ -106,7 +106,7 @@
 |---|---|
 | 状态 | **NOT_ADMITTED** |
 | 证据 | 9 = reserve/accept/claim + offer/release/begin/complete/claim/retire observer（`REQUEST_CORE_SYNCHRONIZATION_COST.md` §2.1）；core 锁计数已被 `9+T+2P` 完全解释（残差 ≤2e−6） |
-| 规模（INFERRED） | 9 对 × 28.61–29.76 cyc = **257–268 cyc/op**；占 core 锁对数 D1 69.2%、D16 48.3%、D64 21.2% |
+| 规模（INFERRED） | 9 对 × 57.22–59.52 cyc/对 = **515–536 cyc/op**（旧稿 257–268 把 pair 数乘以 per-call 价，少算一倍）；占 core 锁对数 D1 69.2%、D16 48.3%、D64 21.2% |
 | 判断 | 没有“哪两次获取保护同一状态且可合并”的证据；这是重新设计问题，不是删除冗余 |
 | 升/降级条件 | 必须逐项指出冗余获取点 + 语义等价证明 + 单因素 A/B |
 
@@ -165,13 +165,13 @@
 
 | ID | 候选 | 状态 | 主要证据类 | 预计规模 | 下一动作 |
 |---|---|---|---|---|---|
-| C1 | pending 重复 take/consume | **EVIDENCE_READY** | COUNTED 调用 + SAMPLED self | 843–853 cyc/op（18.5–18.7%，INFERRED） | 申请 G1/G2 单因素 A/B |
+| C1 | pending 重复 take/consume | **EVIDENCE_READY** | COUNTED 调用 + SAMPLED self | 1,087–1,106 cyc/op（23.9–24.3%，INFERRED；模型值，非净收益） | 申请 G1/G2 单因素 A/B |
 | C2 | O(depth) harvest 扫描 | **RESEARCH_ONLY** | COUNTED + SAMPLED | 85.6 cyc/op self | 并入 C1 |
 | C3 | O(1) 槽索引 | **NOT_ADMITTED** | SAMPLED | 未证明 | 不申请 |
 | C4 | 扫描长度 = 主因 | **NO_GO** | — | — | 关闭 |
 | C5 | harvest = 主成本 | **NO_GO** | — | — | 关闭 |
 | C6 | 删 core mutex | **NO_GO** | SAMPLED + 源码语义 | 1,436.2（全部 lock 符号；core 分摊 1,108.6） | 关闭 |
-| C7 | 合并 9 次锁 | **NOT_ADMITTED** | COUNTED 计数 | 257–268（INFERRED） | 不申请 |
+| C7 | 合并 9 次锁 | **NOT_ADMITTED** | COUNTED 计数 | 515–536（INFERRED） | 不申请 |
 | C8 | TP handoff | **RESEARCH_ONLY** | COUNTED | cycles +95.9%（D16）；CPU +11.9 µs 是**跨线程聚合**，非单核 per-op | 另立研究 |
 | C9 | submit 批处理 | **NOT_ADMITTED** | 结构 COUNTED + NON_EXACT trace | enter/op=1.0000（下界） | 关闭 |
 | C10 | research 计数开销 | **NO_GO（产品）** | COUNTED | IOPS −4.6%…−56.8% | 仅作测量说明 |
@@ -187,7 +187,7 @@
 | (b) | D16 record-root 的 280.3 cyc/op | 4.43% 未列符号 + 1.03% vdso + 0.70% unknown | 低于 0.2% 阈值的符号 |
 | (c) | libc mutex 的 core/fio 拆分 | 31.56% 是全部 lock 符号；core 分摊**估计** 1,108.6（非严格上界，真界 0–1,436.2） | 24.128 对 vs 18.625 对 |
 | (d) | D16 全链 +5,219 instr/+3,164 cycles 的因果拆分 | 无 native 同 build record；fio driver 增量未分离 | Sluice 相关 flat self ≈3.1k（把全部 libc mutex 计入 Sluice 的上界）与 Δ≈3.16k 接近是巧合，不是分解 |
-| (e) | D64 cycles 余量 ≈3.5–3.6k/op | 无 D64 record/BPF；缓存/queueing/内核/调度未分离 | 公式见 `USERSPACE-COST-RESEARCH.md` §H.13：+5,627.7 − (1,342.7 + 683.9–711.4) = 3,573.6–3,601.1 |
+| (e) | D64 cycles 余量 ≈2.86–2.92k/op | 无 D64 record/BPF；缓存/queueing/内核/调度未分离 | 公式见 `USERSPACE-COST-RESEARCH.md` §H.13：+5,627.7 − (1,342.7 + 1,368.0–1,422.8) = 2,862.2–2,917.0 |
 | (f) | TP 的 cycles/CPU 不随指令解释 | 跨线程 handoff/调度/停顿未识别 | D16 instr −1.1%、cycles +96% |
 | (g) | 启动/收尾摊销 | W-C2 7.41%/4.14%/1.01% 是模式差，不是启动成本 | `MODE_OR_TIMING_EFFECT_NOT_IDENTIFIED` |
 | (h) | A2 pmu 跨 abort/resume | rep1 04:38、rep2 04:43、ABORT 04:39:52；IOPS 361,971→381,925、CPU 2.818→2.673 µs | instr 计数不受影响 |

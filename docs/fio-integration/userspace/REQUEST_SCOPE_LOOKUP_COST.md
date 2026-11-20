@@ -33,15 +33,15 @@
 - **每 op 的 resolve 迭代 = take/op × 平均扫描长度**：D64 的 747.4 ≈ 33.5 × 22.3。所谓“O(depth²)”只在这个意义上成立（调用次数 × 每次扫描），不是 core 查找变慢。
 - `resolve iters/take`（1.0→22.3）与 `scan mean`（1.0→32.98）不同：`harvest` 统计的是“看过的槽”（含空槽），`resolve_` 在命中处停止。两者不能互相替代。
 
-## 3. 单次 take 的成本不随扫描长度上升（SAMPLED，n=1/root）
+## 3. 单次 take 的成本不随 resolve 迭代上升（SAMPLED，n=1/root）
 
-| 根 | run | take self | cycles/op | take/op | **cyc/take** | 扫描均值 |
-|---|---|---:|---:|---:|---:|---:|
-| `E5` | A1 record rep1 | 2.44% | 4,787.93 | 2 | **58.41** | 1.0 |
-| `E4` | A2 record-root rep1 | 10.45% | 4,859.52 | 9.5 | **53.45** | ≈8.94 |
-| `E3` | A2 record-root rep1 | 11.68% | 4,550.59 | 9.5 | **55.95** | 8.94 |
+| 根 | run | take self | cycles/op | take/op | **cyc/take** | resolve iters/take | harvest slots/harvest |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `E5` | A1 record rep1 | 2.44% | 4,787.93 | 2 | **58.41** | 1.00 | 1.0 |
+| `E4` | A2 record-root rep1 | 10.45% | 4,859.52 | 9.5 | **53.45** | 6.26 | ≈8.94 |
+| `E3` | A2 record-root rep1 | 11.68% | 4,550.59 | 9.5 | **55.95** | 6.26 | 8.94 |
 
-扫描长度约 9×，单次 take 成本 58.41 → 53.45（−8.5%）或 55.95（−4.2%）。**没有单调上升**；差异在 n=1 的采样噪声量级内，方向也不支持“扫描越长越贵”。
+`resolve_` 迭代/take 从 1.00 增至 6.26（约 6.3×）；8.94 是**上一层 adapter 的 harvest slots/harvest**，不是 take 的扫描长度。单次 take 成本 58.41 → 53.45（−8.5%）或 55.95（−4.2%）。**没有单调上升**；差异在 n=1 的采样噪声量级内，方向也不支持“resolve 迭代越多越贵”。
 
 > 裁决材料里的 `57.45 cyc/take` 使用 r2 的 12.15% 份额（`COST-LEDGER.md:175`），本轮在归档 flat 中**未能复现**该三元组（12.15% / 4,492.11 / 9.499953）。换成 53.45 或 55.95 后，结论方向不变且更强。
 
@@ -69,17 +69,17 @@ D16 时每 op 有 8.5 次 pending take；每次都要：
 | consume self | 139.3 cyc/op | SAMPLED，3.06% |
 | pending 占 take 调用 | 89.47% | COUNTED |
 | pending 分摊 take+consume self | 600.2 cyc/op | INFERRED（按调用数比例，per-call 成本不均匀） |
-| pending 对应的 core 锁（8.5 对 × 28.61–29.76 cyc） | 243.2–253.0 cyc/op | INFERRED（libc pair 价，非 core 专用价） |
-| **合计（粗估，可能偏高）** | **843–853 cyc/op（18.5–18.7%）** | INFERRED；pending consume 比 ready 便宜（不拷 outcome/不清 binding/不回收），按调用数平摊 self 会**高估**。下界：只算 pending core 锁 **243–253 cyc/op（5.3–5.6%）**；上界 923.8（20.3%）。真值在 [243, 853] |
+| pending 对应的 core 锁（8.5 对 × 57.22–59.52 cyc/对） | 486.4–505.9 cyc/op | INFERRED（libc pair 价，非 core 专用价） |
+| **合计（模型估计，不是净收益）** | **1,086.5–1,106.1 cyc/op（约 1,087–1,106；23.9–24.3%）** | INFERRED；pending 与 ready 的平均 self 相同、pending core 锁与全部 libc 锁平均价相同，两个假设均未验证；新方案还要支付就绪登记/单次消费成本。旧稿 243–253/843–853 把 pair 数乘以 per-call 价，少算一倍；`[243,853]` 与 `923.8` 已撤回 |
 
-裁决材料给出的 0.6–1.1k（13–24%）区间与本口径相容；材料中的 506 cyc/op 分摊口径未在证据中给出，本表不采用。
+裁决材料给出的 0.6–1.1k（13–24%）区间与本模型相容；材料中的 506 cyc/op = `8.5 × (1,436.16/24.128)` 是 **pair 口径**，单位正确。本表早期把 8.5 对乘以 28.61–29.76 cyc/调用，少算一倍，已订正为 486–506。
 
 ## 5. 候选裁决
 
 | ID | 候选 | 状态 | 说明 |
 |---|---|---|---|
 | **C1** | pending 重复 take/consume → ready-index / 单次消费 | **EVIDENCE_READY**（只申请 G1/G2 单因素 A/B） | 有 counted 调用负担（pending/op 1/2.5/8.5/32.5）与 SAMPLED self 份额；**反事实未跑，收益未证明** |
-| C3 | `resolve_` → O(1) 槽索引 | **NOT_ADMITTED** | 单次 take 不随扫描长度上升；D4 全链差 < D1；**跨 root/跨会话（E5/E4/E3，n=1）、非单因素**；只否定“显著收益”，不证明无收益 |
+| C3 | `resolve_` → O(1) 槽索引 | **NOT_ADMITTED** | 单次 take 不随 resolve 迭代上升（1.00→6.26 iters/take；8.94 是 adapter 的 harvest slots/harvest，不是 take 扫描）；D4 全链差 < D1；**跨 root/跨会话（E5/E4/E3，n=1）、非单因素**；只否定“显著收益”，不证明无收益 |
 | C4 | “扫描长度是 D16 增量主因” | **NO_GO** | 现有证据不支持（**非单因素证伪**）：增量主要随 take 调用次数 2→9.5 增长；D4<D1 只是旁证 |
 
 ### 5.1 C1 的可证伪预测（**若**做 A/B，应观测到的量）

@@ -38,6 +38,8 @@
 
 形状 = **1..C−1 近似均匀 + C 桶约为单桶 2 倍**，均值落在 `C(C+3)/(2(C+1))`。这是本轮 5 cell × 2 rep 的**描述性观测恒等式**，不是通用定律；`scan_hist` 在 >64 时饱和（本轮 max iodepth=64，未发生，weighted-sum 不变量通过）。
 
+**单位警告**：8.9412 是 **`harvest` 层的 slots/harvest**；`RequestScope::resolve_` 的扫描长度是 `59.499681 / 9.499953 = 6.263156 iters/take`（`E2`，见 `REQUEST_SCOPE_LOOKUP_COST.md` §2）。两者不可互换，不能用 8.94 解释单次 `take`。
+
 ## 3. adapter 自己的成本有多大（SAMPLED）
 
 A2/D16 record-root（`E3`，n=1，10,195 samples，Lost 0，4,550.59 cycles/op）：
@@ -63,7 +65,7 @@ r2 root 会话给出 D16 `harvest` self **1.72%**（`COST-LEDGER.md:175`），�
 
 ## 4. 与深度、构建、观察者的关系（边界）
 
-1. **深度**：adapter 扫描是 O(C)/轮，但每轮成本小；随深度增长的主项是**重复 take 的调用次数**（take/op 2→3.5→9.5→33.5），不是单次扫描变贵。单次 take 成本在扫描长度 1.0→8.94 时没有上升（见 `REQUEST_SCOPE_LOOKUP_COST.md` §3）。
+1. **深度**：adapter 扫描是 O(C)/轮，但每轮成本小；随深度增长的主项是**重复 take 的调用次数**（take/op 2→3.5→9.5→33.5），不是单次扫描变贵。单次 take 成本在 `resolve` 迭代 1.00→6.26 iters/take 时没有上升（见 `REQUEST_SCOPE_LOOKUP_COST.md` §3）；8.94 是 harvest slots/harvest，不是 take 的扫描长度。
 2. **构建**：research 构建插入计数器，instr/op +124…+3,367、IOPS −4.63%…−56.81%（`E2/logs/perturbation-summary.txt`，COUNTED）。计数值（调用数、扫描分布）来自被扰动构建，对 release 动力学的代表性 `NOT_IDENTIFIED`。
 3. **观察者**：record/bpftrace 会改变吞吐（A1 sluice record −13.6%、TP record −35.9%；bpftrace 压到约 7.6k IOPS）。份额只能作路径指示，不作性能结论。
 4. **窗口**：A1/A2 是 10s `time_based`，**W-C2** 是固定 20G；跨模式差 sluice 7.41%，`MODE_OR_TIMING_EFFECT_NOT_IDENTIFIED`，不得当启动成本。

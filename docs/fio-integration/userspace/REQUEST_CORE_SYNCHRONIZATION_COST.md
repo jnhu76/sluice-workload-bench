@@ -60,7 +60,7 @@
 
 | 类别 | 本轮证据 | 类 | 判断 |
 |---|---|---|---|
-| **uncontended 固定成本** | 1,436.2 cyc/op ÷ 48.256 次 = 28.6–29.8 cyc/次；top-2 1,380.6 ÷ 48.256 = 28.61 | SAMPLED 派生 | 主要成分；libc 快路径 + 调用/PLT |
+| **uncontended 固定成本** | 1,436.2 cyc/op ÷ 48.256 次 libc 调用 = 28.6–29.8 cyc/调用；等价地 24.128 对/op → 57.2–59.5 cyc/对；top-2 1,380.6 ÷ 48.256 = 28.61 | SAMPLED 派生 | 主要成分；libc 快路径 + 调用/PLT |
 | **contended waiting** | futex 0.00099–0.00127/op（`E3` bpf-locks，n=6）；off-CPU 100.8–101.0 ms/5s 中约 100.2–100.3 ms 是单次 futex 等待（main 等 job，≈0.0004/op）；runqueue 20–29 µs/5s | COUNTED（bpf） | 稳态未见竞争；job on-CPU 96–98% |
 | **cacheline bouncing** | `xsnp_hitm` 0.0098/op、RFO HITM 0.0074/op、`machine_clears.memory_ordering` 0.2147/op（`E3` pmu-hitm/memorder，n=1） | COUNTED（PMU 100% running） | 未见实质 bouncing |
 | **atomic** | `mem_uops_retired.lock_loads:u` 51.262/op = 48.256 mutex 快路径 + **3.005 core atomics/op**（2 提交 + 1 完成，与源码审计差 0.005） | COUNTED（分解为 INFERRED） | core atomics 很少 |
@@ -87,7 +87,7 @@
 
 - BPF 计数：lock 24.128/op + unlock 24.128/op = 48.256 次调用/op（全部 fio 线程）。
 - research 计数：core lock **18.625/op**（D16）→ core 占 77.2% 的锁对。
-- 因此 record-root 的 1,436.2 cyc/op 中，core 的**分摊估计 = 1,108.6 cyc/op（24.4%）**，其余 ≈327.6（7.2%）属 fio/adapter。**这不是严格上界**：core 单次调用若比平均值更贵，份额可以更高；严格界只有 0–1,436.2。
+- 因此 record-root 的 1,436.2 cyc/op 中，core 的**分摊估计 = 1,108.6 cyc/op（24.4%）**（18.625 对/op ÷ 24.128 对/op，分子分母同为 pair 单位），其余 ≈327.6（7.2%）属 fio/adapter。**这不是严格上界**：core 单次调用若比平均值更贵，份额可以更高；严格界只有 0–1,436.2。
 - 该分摊假设“每次调用同价”，**未测**；24.128 来自 release+sym+BPF，18.625 来自 research → 跨构建拼接。
 
 ## 5. 必要 ≠ 最小：候选状态

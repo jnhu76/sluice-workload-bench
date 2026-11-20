@@ -33,7 +33,7 @@
 
 pending 也走完整路径：一次 `resolve_` 扫描 + 一次 core 锁 + `published` 判定失败后返回（`request_core.cpp:329-331`）。它**不**拷 outcome、**不**清 `binding_live`、**不**回收。所以 pending 的 consume 成本 ≈“锁 + 几次比较”，比 ready 的 consume 便宜；用调用数比例去分摊 self（`REQUEST_SCOPE_LOOKUP_COST.md` §4.1）是**近似**，不是分解。
 
-> 因此把 take+consume self 按调用数比例分摊给 pending（`REQUEST_SCOPE_LOOKUP_COST.md` §4.1 的 600.2）会**高估** pending 的真实 self；该项应读作区间 [243, 853] cyc/op 的上侧，而不是点估计。
+> 因此把 take+consume self 按调用数比例分摊给 pending（`REQUEST_SCOPE_LOOKUP_COST.md` §4.1 的 600.2）会**高估** pending 的真实 self；该项的 pair 口径模型值为 **1,086.5–1,106.1 cyc/op（约 1,087–1,106；23.9–24.3%，INFERRED）**，不是可省净收益；早期 `[243,853]` 区间已因单位错误撤回。
 
 ## 3. 为什么这把锁不能删（`SEMANTICALLY_NECESSARY_UNDER_CURRENT_DESIGN`）
 
@@ -51,7 +51,7 @@ pending 也走完整路径：一次 `resolve_` 扫描 + 一次 core 锁 + `publi
 ### 3.1 30% 不是等待
 
 - `pthread_mutex_lock` 16.03% + `unlock` 14.31% = 30.34%（top-2），全部 lock 符号 31.56%。**SAMPLED**，n=1。
-- BPF：48.256 次 lock/unlock 调用/op，折算 28.6–29.8 cyc/次；futex 仅 0.00099–0.00127/op；job on-CPU 96–98%；HITM 0.0098/op。
+- BPF：48.256 次 lock/unlock 调用/op（24.128 对/op），折算 28.6–29.8 cyc/调用、57.2–59.5 cyc/对；futex 仅 0.00099–0.00127/op；job on-CPU 96–98%；HITM 0.0098/op。
 - uprobe 的“锁持有 1,768 ns”与无竞争 mutbench 1,766.7/1,797.1 ns 在 2% 内 → 测到的是探针开销。
 - 结论：这是**无竞争快路径的 cycles 归属（上限）**，不是 contention，也不是可删除的等待。
 

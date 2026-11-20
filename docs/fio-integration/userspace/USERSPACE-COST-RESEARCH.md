@@ -75,7 +75,8 @@
 |---|---|---|
 | 哈希清单 | `sha256sum -c sha256-manifest.txt --quiet`（在 `E1`/`E2`/`E3`/`E2-pass1-invalidated` 各自目录） | 四者均 `exit=0`；`E1` 936/936、`E2` 340/340、`E3` 179/179；`session-002-counters-pass1-invalidated` 清单 338 条而磁盘 339 文件（`INVALIDATED.json` 在清单生成后写入，未被哈希） |
 | 工具单测 | `python3 -I -m unittest discover -s tools/attribution/tests` | `Ran 64 tests ... OK` |
-| 报告数字复算 | `python3 -I tools/attribution/recompute_userspace_report.py`（只读；解析 `E1`/`E2`/`E3` 的 raw，不跑 fio/perf） | `identities: closure_ok=True flat_sum_ok=True flat_cycles_ok=True`（exit 0）；S1 15 行 per-op、五 cell 锁闭合、record-root 八组（4,550.59 cyc/op）逐项复现；输出即 §B/§D/§F 的表 |
+| 报告数字复算 | `python3 -I tools/attribution/recompute_userspace_report.py`（只读；解析 `E1`/`E2`/`E3` 的 raw，不跑 fio/perf） | `identities: closure_ok=True flat_sum_ok=True flat_cycles_ok=True lock_units_ok=True`（exit 0）；S1 15 行 per-op、五 cell 锁闭合、record-root 八组（4,550.59 cyc/op）逐项复现；输出即 §B/§D/§F 的表 |
+| lock 单位检查 | 同上脚本的 `table_lock_units` | `calls/op == 2 × pairs/op` 三 run 残差 ≤5.28e−4（阈值 1e−3，BPF attach/detach 边界）；per-call 29.76、per-pair 59.52（top-2 57.22）cyc；C1 模型 1,086.5–1,106.1、C7 515.0–535.7 |
 | 计数器单点复核 | `python3 -I -c`（读 `E2/runs/*/counters.json`） | A2 research rep1：`25,521,449,756/3,010,089=8,478.6363` instr/op；`56,062,766/3,010,089=18.624953` core lock/op；`179,099,335/3,010,089=59.499681` resolve iters/op；与 `E2/logs/counts-summary.txt` 一致 |
 | 锁闭合复算 | `python3 -I -c`（用 counts 的 harvest/getevents 代入 `9+T+2P`） | 五 cell 残差 ≤ 2e−6（§F.2） |
 | record-root 复算 | `python3 -I -c`（`E3` 的 `perf-report-flat.txt` 的 Event count ÷ fio `total_ios`） | `16,858,204,391/3,704,623=4,550.5857` cycles/op；八组 flat 分组加总 = 100.00%（§B.3） |
@@ -92,7 +93,7 @@
 提交侧每 accepted I/O：`sluice_queue` 1 → `RequestScope::submit_*` 1 → `AsyncIoContext::submit_*` 1（`access_mtx_` 1 对）→ 虚 `backend_->submit_*` 1 → `RequestCore::reserve/accept/claim_execution`（3 次 core 锁）→ `io_uring_get_sqe`+prep（liburing 头内 inline）→ 1 次 `io_uring_submit`。完成侧：1 CQE → `handle_one_cqe`（`dispatch_mtx_`）→ `offer_terminal`/`release_execution`/`begin_publication`/`complete_publication`/`claim_observer_delivery`/`retire_observer_delivery`（6 次 core 锁）→ 1 次 publication → 1 次 `sluice_event`。观察侧：1 次 `getevents`、harvest≈1.06/op（D16）、take/consume ≈ `K+k`、每 progress pass 2 次 core 锁。A2/D16 的 **SAMPLED** flat self 八组见 §B.3（Scope 531.5、Adapter 241.6、Bridge 139.3、libc lock 1,436.2、publication 63.3、other Sluice 689.9、fio driver 1,168.6、未识别 280.3 cyc/op；合计 4,550.6）。**COUNTED 的结构性每 op 次数（所有深度）**：1 queue、1 SQE、1 enter、1 CQE、1 getevents、1 `sluice_event`、1 条 64 位 `div`、0 堆分配。**随深度变化的每 op 次数（D16 实测；D1/D4/D64 见 §D.1）**：harvest 1.06、take/consume 9.5、core 锁 18.625、libc lock/unlock 48.256（BPF，release+sym；core 计数来自 research）、core atomics 3.005。
 
 **Q2 DEPTH_SCALING（COUNTED）**
-native 基本平坦（2,757.7→2,787.3 instr/op；1,418.6→1,453.6 cyc/op）。sluice-uring：6,430.3→6,038.0→7,992.8→25,256.6 instr/op（D4/D1=0.939、D16/D1=1.243、D64/D1=3.928），4,129.3→3,710.3→4,617.1→10,244.9 cyc/op（D64/D1=2.481）。TP：10,031.1→6,866.9→7,902.2→24,900.4 instr/op（D4/D1=0.685、D64/D1=2.482），12,091.1→8,692.7→9,046.3→15,079.5 cyc/op（D64/D1=1.247）。随深度增长的是**调用次数**：take/op 2→3.5→9.5→33.5（≈C/2+1.5）、pending/op 1→2.5→8.5→32.5（≈C/2+0.5）、resolve iters/op 2→7.5→59.5→747.4、harvest 扫描均值 1.0→2.8→8.94→32.98、core 锁/op 13→13→18.625→42.53（全部 **COUNTED**）。单次 take 的成本没有随扫描长度上升（**SAMPLED**，n=1/root，见 §D.3）。D1→D4 的下降是事实（D1 6,430.3 → D4 6,038.0 instr/op）；一种解释（**未单独验证**）是 D1 每完成约 1 getevents+2 harvest+2 take 的固定开销占主导，D4 的 harvest/op 已降到 1.25。D64 对 sluice-uring 已过拐点：clean0 IOPS 230.4k vs D16 379.6k（−39.3%）。A3（64k seqread）不属于 4k 深度序列。
+native 基本平坦（2,757.7→2,787.3 instr/op；1,418.6→1,453.6 cyc/op）。sluice-uring：6,430.3→6,038.0→7,992.8→25,256.6 instr/op（D4/D1=0.939、D16/D1=1.243、D64/D1=3.928），4,129.3→3,710.3→4,617.1→10,244.9 cyc/op（D64/D1=2.481）。TP：10,031.1→6,866.9→7,902.2→24,900.4 instr/op（D4/D1=0.685、D64/D1=2.482），12,091.1→8,692.7→9,046.3→15,079.5 cyc/op（D64/D1=1.247）。随深度增长的是**调用次数**：take/op 2→3.5→9.5→33.5（≈C/2+1.5）、pending/op 1→2.5→8.5→32.5（≈C/2+0.5）、resolve iters/op 2→7.5→59.5→747.4、harvest 扫描均值 1.0→2.8→8.94→32.98、core 锁/op 13→13→18.625→42.53（全部 **COUNTED**）。单次 take 的成本没有随 `resolve` 迭代数上升（**SAMPLED**，n=1/root，见 §D.3）。D1→D4 的下降是事实（D1 6,430.3 → D4 6,038.0 instr/op）；一种解释（**未单独验证**）是 D1 每完成约 1 getevents+2 harvest+2 take 的固定开销占主导，D4 的 harvest/op 已降到 1.25。D64 对 sluice-uring 已过拐点：clean0 IOPS 230.4k vs D16 379.6k（−39.3%）。A3（64k seqread）不属于 4k 深度序列。
 
 **Q3 NECESSARY_COST（`SEMANTICALLY_NECESSARY_UNDER_CURRENT_DESIGN`）**
 5 把 `std::mutex` + 1 个无锁 `RequestScope`，逐锁职责与删除后果见 §F.1（成本分类见 §F.3）；计数修正为 **core 锁 = 9 + T + 2P**（P = 每 op 的 progress pass 数），五 cell 与实测计数完全闭合（§F.2）。原 U3.2 的 A1 残差 +2.0 不是测量异常，而是漏了 2P。**必要 ≠ 最小**：锁的存在是当前设计的正确性前提；每次获取能否合并/去除，需要重新设计 + 单因素 A/B（§F.5）。“无稳态竞争”只在 fio 单 job 线程下测得（§F.3 scope）。
@@ -101,7 +102,7 @@ native 基本平坦（2,757.7→2,787.3 instr/op；1,418.6→1,453.6 cyc/op）�
 仅 C1（pending 重复 take/consume → ready-index/单次消费）为 **EVIDENCE_READY**，且只申请 G1/G2 单因素 A/B；C2（O(depth) harvest 槽扫描）并入 C1；C3/C7/C9/C11/C13 **NOT_ADMITTED**；C4/C5/C6/C10 **NO_GO**；C8/C12 **RESEARCH_ONLY**。逐项见 `REMOVABLE-WORK-LEDGER.md` 与 §I。
 
 **Q5 UNIDENTIFIED_COST**
-内核/io-wq/IRQ/softirq 未归属（`cycles:k` 只覆盖 fio 线程上下文；io-wq 的 CQE 每 run 仅 1 个、不可归属；IRQ 未探）；D16 未识别 280.3 cyc/op（4.43% 低于阈值符号 + 1.03% vdso + 0.70% unknown）；libc mutex 1,436.2 cyc/op 的 core/fio 拆分（core 按调用数分摊**估计** 1,108.6；不是严格上界，真界 0–1,436.2）；D16 全链 +5,219 instr/+3,164 cycles 的因果拆分；D64 的 cycles 余量约 3.5–3.6k/op（公式见 §H.13）；TP 的“指令不涨而 cycles 涨”；启动/收尾的 `MODE_OR_TIMING_EFFECT_NOT_IDENTIFIED`；A2 pmu 跨 abort/resume；`E1` 二进制不可复核；M-SEM 未对当前二进制重跑；record n=1；U3.3 量纲错误；achieved depth 为 INFERRED。逐条见 §H。
+内核/io-wq/IRQ/softirq 未归属（`cycles:k` 只覆盖 fio 线程上下文；io-wq 的 CQE 每 run 仅 1 个、不可归属；IRQ 未探）；D16 未识别 280.3 cyc/op（4.43% 低于阈值符号 + 1.03% vdso + 0.70% unknown）；libc mutex 1,436.2 cyc/op 的 core/fio 拆分（core 按调用数分摊**估计** 1,108.6；不是严格上界，真界 0–1,436.2）；D16 全链 +5,219 instr/+3,164 cycles 的因果拆分；D64 的 cycles 余量约 2.86–2.92k/op（公式见 §H.13；锁按 pair 计价订正）；TP 的“指令不涨而 cycles 涨”；启动/收尾的 `MODE_OR_TIMING_EFFECT_NOT_IDENTIFIED`；A2 pmu 跨 abort/resume；`E1` 二进制不可复核；M-SEM 未对当前二进制重跑；record n=1；U3.3 量纲错误；achieved depth 为 INFERRED。逐条见 §H。
 
 **Q6 #604 准入建议**
 只有 C1 值得申请**下一阶段研究准入**（G1/G2 单因素 A/B），不是产品准入。**#604 G0 仍未满足**：fio synthetic 不是 real consumer / 代表性 trace（`docs/fio-integration/PHASE1-REPORT.md` §K：「G0 Workload admission … 未进入」）。C2 并入 C1 同一实验；C8/C12 是独立机制研究；C3/C7/C9/C11/C13 不申请；C4/C5/C6/C10 为 NO_GO。**本轮零产品结论**；判词不代表可以修改 Sluice。
@@ -322,16 +323,16 @@ A2 的 g2 原始 rep 值：native 4,273.8 / 4,301.9，sluice 4,695.2 / 4,628.7�
 
 ### D.3 单次 take 的成本不随扫描长度上升（**SAMPLED**，n=1/root）
 
-| 根 | take self | cycles/op | take/op | cyc/take | 扫描均值 |
-|---|---|---|---|---|---|
-| `E5` A1 record rep1 | 2.44% | 4,787.93 | 2 | **58.41** | 1.0 |
-| `E4` A2 record-root rep1 | 10.45% | 4,859.52 | 9.5 | **53.45** | ≈8.94 |
-| `E3` A2 record-root rep1 | 11.68% | 4,550.59 | 9.5 | **55.95** | 8.94 |
+| 根 | take self | cycles/op | take/op | cyc/take | resolve iters/take | harvest slots/harvest |
+|---|---|---|---|---|---|---|
+| `E5` A1 record rep1 | 2.44% | 4,787.93 | 2 | **58.41** | 1.00 | 1.0 |
+| `E4` A2 record-root rep1 | 10.45% | 4,859.52 | 9.5 | **53.45** | 6.26 | ≈8.94 |
+| `E3` A2 record-root rep1 | 11.68% | 4,550.59 | 9.5 | **55.95** | 6.26 | 8.94 |
 
-扫描长度 1.0→8.94（约 9×），单次 take 成本 58.41→53.45/−8.5%（或 55.95/−4.2%）。**没有单调上升**。裁决材料给出的 57.45 cyc/take（`12.15% × 4,492.11 / 9.499953`）对应的 12.15% 份额来自 r2（`COST-LEDGER.md:175`），本报告在归档 flat 中**未能复现**该三元组；无论用 53.45 还是 55.95，结论方向不变且更强。
+`resolve_` 的平均迭代数/take 从 1.00 增至 6.26（约 6.3×）；8.94 是**上一层 adapter 的 harvest slots/harvest**（`E2` §D.1），不是 `take` 的扫描长度，不能用来解释单次 take。单次 take 成本 58.41→53.45/−8.5%（或 55.95/−4.2%），**没有单调上升**。裁决材料给出的 57.45 cyc/take（`12.15% × 4,492.11 / 9.499953`）对应的 12.15% 份额来自 r2（`COST-LEDGER.md:175`），本报告在归档 flat 中**未能复现**该三元组；无论用 53.45 还是 55.95，结论方向不变且更强。
 
 **因此**：
-- C3“resolve_ 线性扫描 → O(1) 槽索引” **NOT_ADMITTED**：单次 take 成本未随长度上升（跨 root、n=1，非单因素），且 D4 全链差（3,260）< D1（3,673）与“扫描越长增量越大”**不一致**（旁证，不单独承担证伪）。
+- C3“resolve_ 线性扫描 → O(1) 槽索引” **NOT_ADMITTED**：单次 take 成本未随 resolve 迭代数上升（1.00→6.26 iters/take；跨 root、n=1，非单因素），且 D4 全链差（3,260）< D1（3,673）与“resolve 迭代越多增量越大”**不一致**（旁证，不单独承担证伪）。
 - C4“扫描长度是 D16 增量主因” **NO_GO**（现有证据不支持，**不是**单因素证伪）：增量主要随 **take 调用次数 2→9.5** 增长；三个 record root 来自不同会话，不能给 cyc/take 的 CI。
 - C1“pending 重复 take/consume” **EVIDENCE_READY**（只申请 G1/G2 单因素 A/B）：counted 调用负担 + 可证伪的预测（§I）。
 
@@ -407,7 +408,7 @@ A2 的 g2 原始 rep 值：native 4,273.8 / 4,301.9，sluice 4,695.2 / 4,628.7�
 
 | 成本类别 | 本轮证据 | 类 | 结论 |
 |---|---|---|---|
-| uncontended lock/unlock 固定成本 | 1,436.2 cyc/op ÷ 48.256 次调用 = **28.6–29.8 cyc/次**；top-2 1,380.6 ÷ 48.256 = 28.61 | SAMPLED 派生 | 主要成分。是 libc 快路径（含 `lock cmpxchg`）与调用/PLT，不是等待 |
+| uncontended lock/unlock 固定成本 | 1,436.2 cyc/op ÷ 48.256 次 libc 调用 = **28.6–29.8 cyc/调用**；top-2 1,380.6 ÷ 48.256 = 28.61。等价地，24.128 对/op → **57.2–59.5 cyc/对**（下文按“对”计价的项一律用此 pair 价） | SAMPLED 派生 | 主要成分。是 libc 快路径（含 `lock cmpxchg`）与调用/PLT，不是等待 |
 | contended waiting | 见下表（futex 调用/等待/总时长分开） | COUNTED（bpf，n=6） | **fio 单 job 线程下未观察到稳态竞争**；job on-CPU 96–98% |
 | cacheline bouncing | `xsnp_hitm` 0.0098/op、RFO HITM 0.0074/op、`machine_clears.memory_ordering` 0.2147/op（`E3` pmu-hitm/memorder，n=1） | COUNTED（PMU，100% running） | 未见实质 bouncing |
 | atomic | `lock_loads 51.262/op` = 48.256（24.128 对 × 多线程标定 2.0003 locked ops/pair）mutex 快路径 + **3.005 core atomics/op**（2 提交 + 1 完成，与源码审计精确到 0.005） | COUNTED（PMU 分解为 INFERRED） | core atomics 很少；主体是 mutex 快路径 |
@@ -426,7 +427,7 @@ A2 的 g2 原始 rep 值：native 4,273.8 / 4,301.9，sluice 4,695.2 / 4,628.7�
 
 **scope**：以上全部是 **fio 单 job 线程**；多 submitter 的 product API 未测（`REQUEST_CORE_SYNCHRONIZATION_COST.md` §6），不得外推。
 
-**硬边界**：record-root 的 31.56% 是**全部 libc lock 符号**，其中包含 fio 自己的 mutex。按调用数分摊的**估计**是 `1,436.2 × 18.625/24.128 = 1,108.6 cyc/op`（24.4%），其余 ≈327.6 cyc/op（7.2%）属 fio/adapter。**这不是严格上界**：若 core 每次调用比全部 lock 的平均更贵，core 份额可以超过 1,108.6；可用的界只有 0–1,436.2（或把全部 libc mutex 计入 Sluice 的 3.1k）。该分摊还假设“每次调用成本相同”（**未测**），且 24.128 对/op 来自 release+sym+BPF、18.625 对来自 research → 跨构建拼接，**INFERRED**。
+**硬边界**：record-root 的 31.56% 是**全部 libc lock 符号**，其中包含 fio 自己的 mutex。按锁对数分摊（18.625 对/op ÷ 24.128 对/op，分子分母同为 pair 单位）的**估计**是 `1,436.2 × 18.625/24.128 = 1,108.6 cyc/op`（24.4%），其余 ≈327.6 cyc/op（7.2%）属 fio/adapter。**这不是严格上界**：若 core 每次调用比全部 lock 的平均更贵，core 份额可以超过 1,108.6；可用的界只有 0–1,436.2（或把全部 libc mutex 计入 Sluice 的 3.1k）。该分摊还假设“每次调用成本相同”（**未测**），且 24.128 对/op 来自 release+sym+BPF、18.625 对来自 research → 跨构建拼接，**INFERRED**。
 
 ### F.4 为什么“29% 不是 29% 锁等待”
 
@@ -490,7 +491,7 @@ A2 的 g2 原始 rep 值：native 4,273.8 / 4,301.9，sluice 4,695.2 / 4,628.7�
 10. **consumer 与 fio 不同构**：64 MiB tmpfs 顺序 positional read、无 fio driver、每完成 `wait_for`、lifecycle 含 3 phase（`540,000 = 9 轮 × 3 phase × 20,000`，`S:bench/bench_w02_pipeline.cpp:137,526,581,589,735`）；不能把 TP−uring 的 +156.5%/+175.4% cycles 映射到 fio A2。
 11. **bpftrace 扰动**：A2 被压到约 7.6k–7.7k IOPS（约 50× 放慢）；`bpftrace_returncode=124` 是 timeout 窗口到期；trace 计数标 `NO_LOSS_RECEIPT / NON_EXACT`，只作下界。
 12. **协议连续性**：`E1` 中途把 loadavg 超限从 “aborts immediately” 改为 pause+keep（`tools/attribution/baseline_session.py:533-561`），3 个 run 在 2.56/2.53/2.65 下保留并写 `env-pause.json`；`runs-manifest.json` 只记 ok。这不影响 instr 计数，但影响“会话严格性”的叙述。
-13. **D64 余量的算法（INFERRED，不是测量）**：D64−D16 cycles = 10,244.86 − 4,617.13 = **+5,627.73**；可解释部分 = 额外 take（33.4976 − 9.5000 = 23.9976 次 × 55.95 cyc/take = **1,342.7**）+ 额外 core 锁（42.5288 − 18.6250 = 23.9039 对 × 28.61–29.76 = **683.9–711.4**）= **2,026.6–2,054.1**；残差 = **3,573.6–3,601.1 cyc/op（≈3.5–3.6k）**。假设：单次 take 成本在 D16/D64 相同、core 锁按 libc pair 价、只计 take/lock 两项。D64 无 record-root，故这是模型残差，不是测量。
+13. **D64 余量的算法（INFERRED，不是测量）**：D64−D16 cycles = 10,244.86 − 4,617.13 = **+5,627.73**；可解释部分 = 额外 take（33.4976 − 9.5000 = 23.9976 次 × 55.95 cyc/take = **1,342.7**）+ 额外 core 锁（42.5288 − 18.6250 = 23.9039 对 × **57.22–59.52 cyc/对** = **1,368.0–1,422.8**）= **2,710.7–2,765.5**；残差 = **2,862.2–2,917.0 cyc/op（≈2.86–2.92k）**。假设：单次 take 成本在 D16/D64 相同、core 锁按 libc pair 价、只计 take/lock 两项。D64 无 record-root，故这是模型残差，不是测量。**旧稿把 23.9039 对乘以 28.61–29.76 cyc/调用，少算一倍；已按 pair 价订正。**
 
 ---
 
@@ -500,10 +501,10 @@ A2 的 g2 原始 rep 值：native 4,273.8 / 4,301.9，sluice 4,695.2 / 4,628.7�
 
 | ID | 候选 | 状态 | 一句话理由 |
 |---|---|---|---|
-| C1 | pending 重复 take/consume（ready-index/单次消费） | **EVIDENCE_READY**（只申请 G1/G2 A/B） | counted pending/op 1/2.5/8.5/32.5、take/op 2/3.5/9.5/33.5；每次 pending take 一次 core 锁；D16 take+consume self 670.8 cyc/op；反事实未跑 |
+| C1 | pending 重复 take/consume（ready-index/单次消费） | **EVIDENCE_READY**（只申请 G1/G2 A/B） | counted pending/op 1/2.5/8.5/32.5、take/op 2/3.5/9.5/33.5；每次 pending take 一次 core 锁；D16 take+consume self 670.8 + pending 锁 486–506 = 模型 1,087–1,106 cyc/op（23.9–24.3%，INFERRED；非可省净收益）；反事实未跑 |
 | C2 | O(depth) harvest 槽扫描 | **RESEARCH_ONLY**（并入 C1） | harvest self 1.72–1.88%；是 C1 的上游触发器，不单列 |
-| C3 | `resolve_` → O(1) 槽索引 | **NOT_ADMITTED** | 单次 take 58.41→53.45/−8.5%（或 55.95/−4.2%），扫描 1.0→8.94；跨 root/跨会话（E5/E4/E3，n=1）、非单因素；只否定“显著收益”，不证明无收益 |
-| C4 | “扫描长度是 D16 增量主因” | **NO_GO** | 现有证据不支持（**非单因素证伪**）；增量主要随 take 调用次数 2→9.5 增长 |
+| C3 | `resolve_` → O(1) 槽索引 | **NOT_ADMITTED** | 单次 take 58.41→53.45/−8.5%（或 55.95/−4.2%），resolve 迭代 1.00→6.26 iters/take（8.94 是 adapter 的 harvest slots/harvest，不是 take 扫描）；跨 root/跨会话（E5/E4/E3，n=1）、非单因素；只否定“显著收益”，不证明无收益 |
+| C4 | “扫描长度是 D16 增量主因” | **NO_GO** | 现有证据不支持（**非单因素证伪**）；增量主要随 take 调用次数 2→9.5 增长；三个 record root 各 n=1、跨会话，不能作因果证伪 |
 | C5 | “harvest 扫描是用户态主成本” | **NO_GO** | harvest self 1.88%；take/consume/mutex 才是大头 |
 | C6 | 删除/替换 core mutex、lock-free consume | **NO_GO** | publication/terminal visibility/reclamation/unique consumption 的必需串行化 |
 | C7 | 合并固定 9 次 core 锁 | **NOT_ADMITTED** | 9 次是当前语义边界；计数已被 9+T+2P 完全解释 |
@@ -522,13 +523,13 @@ A2 的 g2 原始 rep 值：native 4,273.8 / 4,301.9，sluice 4,695.2 / 4,628.7�
 
 ## J. Independent Review（独立复核）
 
-### J.1 对抗性证伪的结论（12 项）
+### J.1 对抗性证伪的结论（10 项）
 
 > 本表的 **REFUTED** 一律按 §0.1.3 的语义读作“**现有证据不支持**（weak refutation）”，不是单因素证伪；唯一接近单因素的是 C6 的源码级删除矩阵。
 
 | 主张 | 判定 | 依据（本轮可见证据） |
 |---|---|---|
-| D16 增量由 `resolve_` 线性扫描造成 | **REFUTED** | 单次 take 成本不随扫描长度上升（§D.3）；D4 全链差 < D1 |
+| D16 增量由 `resolve_` 线性扫描造成 | **REFUTED（弱）** | 现有证据不支持：单次 take 成本不随 resolve 迭代上升（§D.3）；D4 全链差 < D1；三个 record root 各 n=1、跨会话，不能作单因素因果证伪 |
 | adapter harvest/slot 扫描是用户态主成本 | **REFUTED** | harvest self 1.88%（`E3`），children 30.50% 里 28.47pp 是 core take |
 | take 成本主要来自 ticket lookup | **REFUTED** | 同上；take self 11.68% < mutex 30.34% |
 | consume 中存在可直接删除的同步 | **REFUTED** | `request_core.cpp:325` 的同一临界区完成 published 判定/拷贝/绑定释放/回收 |
@@ -555,7 +556,7 @@ A2 的 g2 原始 rep 值：native 4,273.8 / 4,301.9，sluice 4,695.2 / 4,628.7�
 1. **`9+T` → `9+T+2P`**：每 progress pass 另有两次 core 锁（`outstanding_summary` + `health_failed`），五 cell 与实测计数闭合到 ≤2e−6。这是**解释性修正**，不改变“锁数随深度上升”的方向，也不改变“无可删除冗余锁”的结论。
 2. **两处数字未能复现，按 raw 处理**：
    - `E3` 的 `57.45 cyc/take`（来自 r2 的 12.15% 份额）在归档 flat 中找不到；本报告用 `53.45`（`E4`，10.45%）与 `55.95`（`E3`，11.68%）替代，结论不变。
-   - 裁决材料的 “pending 分摊 core 锁约 506 cyc/op” 的分摊口径未在证据中给出；本报告改用可复算口径：pending take+consume self `670.8 × 0.894736 = 600.2` cyc/op，pending 对应的 core 锁按 libc pair 价 `8.499953 × 28.61…29.76 = 243.2…253.0` cyc/op，合计 **843–853 cyc/op（18.5–18.7%）**；若把 take/consume self 全额计入则上限为 `670.8 + 253.0 = 923.8`（20.3%）。**该点估计可能偏高**（pending consume 比 ready 便宜，按调用数平摊 self 会高估），下界只算 pending core 锁为 **243–253 cyc/op（5.3–5.6%）**，真值在 [243, 853]。仍落在裁决给出的 0.6–1.1k（13–24%）区间内，且明确标 **INFERRED**：per-call 成本不均匀，core/fio 未拆。
+   - 裁决材料的 “pending 分摊 core 锁约 506 cyc/op” 可用 `8.5 × (1,436.16/24.128) = 505.9` 复算，单位正确；本报告早期把它写成 243–253，是把 8.5 **对**乘以了 28.61–29.76 cyc/**调用**，少算一倍。订正后的可复算口径：pending take+consume self `670.8 × 0.894736 = 600.2` cyc/op，pending 对应的 core 锁按 libc **pair 价** `8.499953 × 57.22…59.52 = 486.4…505.9` cyc/op，合计 **1,086.5–1,106.1 cyc/op（约 1,087–1,106；23.9–24.3%）**。**该模型值仍叠加两个未验证假设**：pending 与 ready 的平均 self 相同、pending core 锁与全部 libc 锁的平均价相同；新方案还要支付就绪登记/单次消费成本。因此 1,087–1,106 是**模型估计，不是可省净收益，也不是真值区间**；旧稿的 `[243, 853]` 与 `923.8 上限` 已撤回，净节省必须由 A/B 测出。仍落在裁决给出的 0.6–1.1k（13–24%）区间内，且明确标 **INFERRED**：per-call 成本不均匀，core/fio 未拆。
 
 ---
 
@@ -586,7 +587,7 @@ A2 的 g2 原始 rep 值：native 4,273.8 / 4,301.9，sluice 4,695.2 / 4,628.7�
 | R1 | C1 单因素 A/B（ready-index/单次消费），保持 fio 完成观察与 progress 语义 | #604 G0 或 Owner 明确豁免；语义等价证明；同 build 对照 | **主判据（机制）**：take/op 与 core lock/op 达到预测降幅的 ≥90%（D16 take ≤1.85、core 锁 ≤11.0；D64 core 锁 ≤13.3）。**次判据（不伤害）**：D16/D64 clean0 IOPS 不低于同 build A/A 极差（S2 实测最大 2.196%）；CPU/op 不升。**决策规则**：若操作数达标而 IOPS 不变，C1 记为“机制成立、吞吐中性”，产品价值改看 CPU/op 与 headroom，不以 IOPS 作收益门槛。 |
 | R2 | C2 并入 R1（不单独开实验） | 同 R1 | harvest 扫描与重复 take 同降；harvest self 变化可测 |
 | R3 | native 同 build 的 record 分区（补 D16 因果拆分） | 有 `b1e28` 对应的 native 记录方案 | Sluice flat self 与全链 Δ 的可加性检验 |
-| R4 | D64 record/BPF（解释约 3.5–3.6k cyc/op 余量，§H.13） | 采样预算 | 余量落到具体符号或内核侧 |
+| R4 | D64 record/BPF（解释约 2.86–2.92k cyc/op 余量，§H.13） | 采样预算 | 余量落到具体符号或内核侧 |
 | R5 | 对当前二进制重跑 M-SEM | — | 语义门对 `b1e28+ca4a6c` 成立 |
 | R6 | 内核/io-wq/IRQ 归因（C12） | 独立研究范围 | 至少给出 io-wq 工作量的可归属上界 |
 
