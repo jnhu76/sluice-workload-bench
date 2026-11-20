@@ -59,7 +59,7 @@ COST-ATTRIBUTION-METHOD.md（14:29 冻结，早于首个测量 run 14:31）；�
 （cycles:k/instructions:k 100% running）、bpftrace/eBPF、io_uring/sched
 tracepoints 均 SUPPORTED；`perf record --call-graph dwarf|fp` 实跑成功
 （A2 sluice dwarf 10,178 samples、perf 未报告 lost；kernel fp 10,053
-samples、perf 未报告 lost——均非零丢失证明），但 capability 子项
+samples、perf 未报告 lost——均不是零丢失证明），但 capability 子项
 `perf_callgraph_user=PARTIAL`（探针符号解析），
 不是“全部 SUPPORTED”。`context-switches` 计数有效；`cpu-migrations` 的
 capability 探针记为 UNAVAILABLE（sleep 探针 0 次迁移，属假阴性），而 g3
@@ -267,7 +267,7 @@ native 1.01% 当作本会话精度。root 行保留原始 event 键，并带 `la
    通过，标 `window_basis=RECONSTRUCTED_FROM_JOB` /
    `attach_basis=ASSUMED_1S`。
 3. **调用栈（A2 sluice，dwarf，10,178 samples，perf report 显示 10K，
-   0 lost〔perf 无报告，非零丢失证明〕；root 会话只有 A2 的 dwarf 调用树，
+   0 lost〔perf 无报告，不是零丢失证明〕；root 会话只有 A2 的 dwarf 调用树，
    A1/sluice-uring 无 `record-root` 回执，故调用树本身不能证明深度依赖）**：
    `sluice_getevents` 44.42%（harvest→take→consume 27.63/25.97/15.52%；
    poll→reap→handle_one_cqe 16.36/8.40/7.59%；publish_one 5.48%）、
@@ -333,8 +333,8 @@ punt/cqe/futex）、dwarf 调用栈与内核栈。关键热点获得限定范围
 因果；本判词不构成 whole-system 全成本结论，也不是"CPU 账本完整"的证明。
 
 - **工具交付**：`tools/profile_fio_sluice.py` + `tools/attribution/`（probe/
-  clean/clean0/pmu/record/trace/crosscheck/analyze，薄编排层）+ 72 项测试
-  （64 项 r3 基线 + 8 项本轮审计修复）
+  clean/clean0/pmu/record/trace/crosscheck/analyze，薄编排层）+ 73 项测试
+  （64 项 r3 基线 + 9 项本轮审计修复）
   （其中 12 项强制用例）；证据树可整树复算、哈希可独立校验。
 - **产品决策**：零产品结论。未触碰 #604 G0、#595（KEEP_IMMEDIATE）、
   #617、#621、#623；未修改 Sluice/fio 语义。热点账本仅作为 #639 的

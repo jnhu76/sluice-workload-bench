@@ -1168,6 +1168,18 @@ class TestWindowContractRepairs(unittest.TestCase):
         self.assertIn("not", window["note"].lower())
 
 
+class TestAnalyzeManifest(unittest.TestCase):
+    def test_manifest_unreadable_fails_closed(self):
+        import profile_fio_sluice
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / "sha256-manifest.txt"
+        path.write_text("abc  runs/ok/meta.json\n")
+        self.assertFalse(profile_fio_sluice.manifest_has_unreadable(path))
+        path.write_text("UNREADABLE(RuntimeError)  runs/x/perf.data\n")
+        self.assertTrue(profile_fio_sluice.manifest_has_unreadable(path))
+
+
 class TestAnalyzeEbpfRows(unittest.TestCase):
     def test_analysis_exposes_ebpf_row_classes(self):
         tmp = pathlib.Path(tempfile.mkdtemp())

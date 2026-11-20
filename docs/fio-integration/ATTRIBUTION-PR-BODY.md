@@ -37,7 +37,7 @@
   instructions:k、bpftrace（io_uring syscall+submit_req+punt+complete+
   futex+sched dwell）、perf record --call-graph dwarf/fp（capability 子项
   `perf_callgraph_user=PARTIAL`，实跑成功：A2 sluice dwarf 10,178
-  samples、perf 未报告 lost（非零丢失证明））；context-switches 精确计数；
+  samples、perf 未报告 lost（不是零丢失证明））；context-switches 精确计数；
   cpu-migrations 的
   capability 探针为 UNAVAILABLE（sleep 探针 0 次迁移，假阴性），g3 实跑
   有 42–87 次、100% time-running，故只作旁证；io-wq 归属仍 UNAVAILABLE
@@ -48,7 +48,7 @@
   perf --call-graph dwarf/fp（事件打不开；perf 失败仍 exit 0，已按输出
   文本判定）
 - 判词：`PARTIAL_CPU_ACCOUNTING`——用户态归因完整，内核侧明示不可测，
-  缺项不以 0 冒充（72 项自动化测试：64 项 r3 基线 + 8 项本轮审计修复；
+  缺项不以 0 冒充（73 项自动化测试：64 项 r3 基线 + 9 项本轮审计修复；
   其中 12 项强制用例守护该不变量）
 
 ## 实际运行的 workload（G2 预注册冻结）
@@ -166,11 +166,13 @@ session-002-root 74 个、13 个排除）。原始 perf.data 未入 git（sessio
 
 ## Closeout verification（验证对象：PR head；含 `5e4fd0e` 与后续 manifest/renderer 修复）
 
-- `python3 -m unittest discover -s tools/attribution/tests`: **Ran 72 tests
-  ... OK**（64 项 r3 基线 + 8 项审计修复）。
+- `python3 -m unittest discover -s tools/attribution/tests`: **Ran 73 tests
+  ... OK**（64 项 r3 基线 + 9 项审计修复）。
 - 两棵证据树 `sha256sum -c sha256-manifest.txt --quiet`：session-001
   **785/785**、session-002-root **311/311**，均 exit 0（`analyze` 后重新
   生成 manifest，覆盖 `analysis/*.json`）。
+- `analyze` 在 manifest 含 `UNREADABLE(...)` 时 fail closed（exit 1），
+  避免无 sudo 时生成不可验证清单。
 - `analyze --results-dir results/attribution/session-001` 与
   `session-002-root`: **exit 0**；`sha_mismatch_free=True`；
   `session-002-root` 74 runs / 13 排除。

@@ -76,6 +76,19 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def manifest_has_unreadable(path: pathlib.Path) -> bool:
+    """True if the sha256 sidecar contains an UNREADABLE(...) entry.
+
+    A manifest with unreadable files cannot support the tree's integrity
+    claim; analyze must fail closed instead of exiting 0.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    return "UNREADABLE(" in text
+
+
 def main() -> int:
     args = parse_args()
     root = pathlib.Path(__file__).resolve().parents[1]
@@ -100,6 +113,11 @@ def main() -> int:
             ramp_s=args.ramp_time, file_size=args.file_size, fio=args.fio,
             fio_diag=args.fio_diag, sudo_pw=sudo_pw)
         manifest_session.write_sha_manifest()
+        if manifest_has_unreadable(results / "sha256-manifest.txt"):
+            print("analyze: sha256-manifest contains UNREADABLE entries; "
+                  "rerun with --sudo-password-env set so root-owned "
+                  "perf.data can be hashed")
+            return 1
         print("runs=%d discarded=%d sha_mismatch_free=%s verdict=%s"
               % (analysis["runs_total"], analysis["runs_discarded"],
                  analysis["sha_mismatch_free"],
