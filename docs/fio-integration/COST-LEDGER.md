@@ -263,7 +263,8 @@ fio_ioring_prep/queued、io_completed…）。TP 对照：mutex/condvar
 ## 8. Root 会话补充（session-002-root，`FULL_FOR_MEASURED_SCOPES` CPU accounting）
 
 独立会话（不与 session-001 混合）：E5 同一机器、同一 SLA/负载形状；
-Owner 现场授权 sudo（密码仅经 `sudo -S` stdin，未落盘）。capability.json
+Owner 现场授权 sudo（密码仅经 `sudo -S` stdin 传入；未写入仓库/证据树/
+git；workflow 草稿的明文已替换为占位符）。capability.json
 判词 **`FULL_FOR_MEASURED_SCOPES`**（定义见 ATTRIBUTION-RESULTS.md §B）：
 kernel cycles、eBPF、io_uring/sched tracepoints 全部 SUPPORTED；
 `--call-graph dwarf/fp` 可用。**该判词只覆盖已测 scope**：本会话

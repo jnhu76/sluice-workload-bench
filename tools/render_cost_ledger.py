@@ -217,6 +217,15 @@ def render_bpf(norm: dict) -> str:
         elif label == "EBPF_UNAVAILABLE":
             counts = "UNAVAILABLE"
             evidence = row.get("reliability")
+        elif label == "EBPF_WINDOW_OVERSHOOT":
+            summary = row.get("summary") or {}
+            counts = json.dumps(summary.get("counts") or {},
+                                sort_keys=True)
+            evidence = ("lower bound; window overshoot; %s"
+                        % row.get("reliability"))
+        elif label == "EBPF_WINDOW_UNVERIFIED":
+            counts = "UNVERIFIED"
+            evidence = row.get("reliability")
         else:
             counts = json.dumps((row.get("summary") or {}).get("counts")
                                 or {}, sort_keys=True)

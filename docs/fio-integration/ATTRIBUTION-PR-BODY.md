@@ -23,7 +23,7 @@
   312 文件；`runs-manifest.json` 的 98 条是含重试的条目，唯一 run_id
   63）。密码仅经 `sudo -S` stdin 传入 sudo 会话，未写入仓库/证据树/git；
   workflow 草稿文件曾保存明文密码（gitignored，未进 git、未进证据树），
-  已在收口时删除。**判词定义
+  明文已替换为占位符；文件仍为本地草稿。**判词定义
   见 ATTRIBUTION-RESULTS.md §B**：只表示已测 scope（:u/:k PMU、eBPF
   聚合计数、调用栈）齐备；io-wq/kworker 归属、IRQ/softirq、K/R/P/O 逐
   请求因果仍未闭合，不等于 whole-system 全成本归因。
@@ -48,7 +48,7 @@
   perf --call-graph dwarf/fp（事件打不开；perf 失败仍 exit 0，已按输出
   文本判定）
 - 判词：`PARTIAL_CPU_ACCOUNTING`——用户态归因完整，内核侧明示不可测，
-  缺项不以 0 冒充（70 项自动化测试：64 项 r3 基线 + 6 项本轮审计修复；
+  缺项不以 0 冒充（72 项自动化测试：64 项 r3 基线 + 8 项本轮审计修复；
   其中 12 项强制用例守护该不变量）
 
 ## 实际运行的 workload（G2 预注册冻结）
@@ -164,10 +164,13 @@ session-002-root 74 个、13 个排除）。原始 perf.data 未入 git（sessio
 侧车，缺失本地树时只能重跑对应会话（root 数据需 sudo）复现。无 sudo
 口令或秘密。
 
-## Closeout verification（验证对象：代码提交 `5e4fd0e`；后续仅文档计数变更）
+## Closeout verification（验证对象：PR head；含 `5e4fd0e` 与后续 manifest/renderer 修复）
 
-- `python3 -m unittest discover -s tools/attribution/tests`: **Ran 70 tests
-  ... OK**（64 项 r3 基线 + 6 项审计修复）。
+- `python3 -m unittest discover -s tools/attribution/tests`: **Ran 72 tests
+  ... OK**（64 项 r3 基线 + 8 项审计修复）。
+- 两棵证据树 `sha256sum -c sha256-manifest.txt --quiet`：session-001
+  **785/785**、session-002-root **311/311**，均 exit 0（`analyze` 后重新
+  生成 manifest，覆盖 `analysis/*.json`）。
 - `analyze --results-dir results/attribution/session-001` 与
   `session-002-root`: **exit 0**；`sha_mismatch_free=True`；
   `session-002-root` 74 runs / 13 排除。

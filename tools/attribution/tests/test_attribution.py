@@ -617,6 +617,25 @@ class TestBpfRowEvidence(unittest.TestCase):
         self.assertIn("lower bound", out)
         self.assertIn("dwell INVALID", out)
 
+    def test_renderer_consumes_window_overshoot(self):
+        maps = parse_bpftrace.parse_maps("@enter[fio]: 10\n@cqe[fio]: 10\n")
+        row = report._bpf_row(self._run(
+            maps, meta={"bpf_window_s": 16, "wall_s": 15.5,
+                        "bpf_attach_s": 1.0}))
+        out = render_cost_ledger.render_bpf(
+            {"A1/io_uring": {"trace-bpf": [row]}})
+        self.assertIn("EBPF_WINDOW_OVERSHOOT", out)
+        self.assertIn("lower bound", out)
+        self.assertIn("window overshoot", out)
+
+    def test_renderer_consumes_window_unverified(self):
+        maps = parse_bpftrace.parse_maps("@enter[fio]: 10\n@cqe[fio]: 10\n")
+        row = report._bpf_row(self._run(maps, meta={}))
+        out = render_cost_ledger.render_bpf(
+            {"A1/io_uring": {"trace-bpf": [row]}})
+        self.assertIn("EBPF_WINDOW_UNVERIFIED", out)
+        self.assertIn("UNVERIFIED", out)
+
     def test_threadpool_io_uring_counters_are_not_applicable(self):
         maps = parse_bpftrace.parse_maps(
             "@futex[fio]: 100\n@dwell[fio]: 1000\n")

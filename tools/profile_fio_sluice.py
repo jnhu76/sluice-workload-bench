@@ -84,19 +84,28 @@ def main() -> int:
     results.mkdir(parents=True, exist_ok=True)
     scratch.mkdir(parents=True, exist_ok=True)
 
+    sudo_pw = os.environ.get(args.sudo_password_env)
+    if sudo_pw:
+        # The password is only piped to `sudo -S`; do not let every child
+        # (fio, perf, strace) inherit it through the environment.
+        os.environ.pop(args.sudo_password_env, None)
+
     if args.mode == "analyze":
         analysis = report_mod.analyze_session(results)
+        # analyze rewrites analysis/*.json; regenerate the sha256 sidecar so
+        # the evidence tree's integrity claim still covers the current files.
+        # Root-owned perf.data is hashed through the Owner-granted sudo stdin.
+        manifest_session = runner_mod.Session(
+            results, scratch, cpu_set=args.cpu_set, runtime_s=args.runtime,
+            ramp_s=args.ramp_time, file_size=args.file_size, fio=args.fio,
+            fio_diag=args.fio_diag, sudo_pw=sudo_pw)
+        manifest_session.write_sha_manifest()
         print("runs=%d discarded=%d sha_mismatch_free=%s verdict=%s"
               % (analysis["runs_total"], analysis["runs_discarded"],
                  analysis["sha_mismatch_free"],
                  analysis["cpu_accounting_verdict"]))
         return 0 if analysis["sha_mismatch_free"] else 1
 
-    sudo_pw = os.environ.get(args.sudo_password_env)
-    if sudo_pw:
-        # The password is only piped to `sudo -S`; do not let every child
-        # (fio, perf, strace) inherit it through the environment.
-        os.environ.pop(args.sudo_password_env, None)
     if args.mode in ("pmu-root", "record-root", "trace-bpf") and not sudo_pw:
         print("root mode requires --sudo-password-env variable to be set")
         return 2
